@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">VibeReader</string>
+    <string name="wallpaper_service_name">VibeReader Quotes</string>
+    <string name="wallpaper_description">A wallpaper preview for your saved reading quotes.</string>
+</resources>
