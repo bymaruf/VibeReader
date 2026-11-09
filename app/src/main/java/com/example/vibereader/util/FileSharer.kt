@@ -7,6 +7,7 @@ import android.widget.Toast
 import androidx.core.content.FileProvider
 import com.example.vibereader.data.room.BookEntity
 import com.example.vibereader.data.room.QuoteEntity
+import com.example.vibereader.domain.model.EBookFormat
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -27,21 +28,21 @@ object FileSharer {
                 return
             }
         }
-        val mimeType = when {
-            book.format.equals("PDF", ignoreCase = true) -> "application/pdf"
-            book.format.equals("EPUB", ignoreCase = true) -> "application/epub+zip"
-            else -> {
-                showError(context, "This book format cannot be shared.")
-                return
-            }
+        val mimeType = EBookFormat.fromLabel(book.format)?.mimeType ?: run {
+            showError(context, "This book format cannot be shared.")
+            return
         }
         launchChooser(
             context,
             Intent(Intent.ACTION_SEND).apply {
                 type = mimeType
                 putExtra(Intent.EXTRA_STREAM, uri)
-                putExtra(Intent.EXTRA_SUBJECT, book.title)
-                clipData = android.content.ClipData.newUri(context.contentResolver, book.title, uri)
+                putExtra(Intent.EXTRA_SUBJECT, book.displayTitle())
+                clipData = android.content.ClipData.newUri(
+                    context.contentResolver,
+                    book.displayTitle(),
+                    uri,
+                )
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             },
             "Share Book File",
@@ -49,7 +50,7 @@ object FileSharer {
     }
 
     fun shareQuoteText(context: Context, quote: QuoteEntity, bookTitle: String) {
-        val formatted = "\"${quote.text}\"\n\n— Extracted from $bookTitle via VibeReader"
+        val formatted = "\"${quote.selectedText}\"\n\n— Extracted from $bookTitle via VibeReader"
         launchChooser(
             context,
             Intent(Intent.ACTION_SEND).apply {
@@ -69,7 +70,7 @@ object FileSharer {
         }
         val imageFile = File(outputDirectory, "quote-${quote.id}.png")
         try {
-            QuoteImageRenderer.write(imageFile, quote.text, bookTitle)
+            QuoteImageRenderer.write(imageFile, quote.selectedText, bookTitle)
             val uri = FileProvider.getUriForFile(
                 context,
                 "${context.packageName}.fileprovider",

@@ -6,6 +6,10 @@ import androidx.security.crypto.MasterKey
 import com.example.vibereader.model.AiProvider
 import com.example.vibereader.model.ProviderKeyConfig
 
+/**
+ * Legacy provider enum kept so keys saved by older versions remain readable.
+ * New code should always use [AiProvider].
+ */
 enum class ApiProvider(val preferenceKey: String) {
     OPENROUTER("openrouter_api_key"),
     CLAUDE("claude_api_key"),
@@ -44,7 +48,12 @@ class ApiKeyStore(context: Context) {
             AiProvider.OPENROUTER -> editor
                 .putString(ApiProvider.OPENROUTER.preferenceKey, apiKey)
                 .putString(API_KEY, apiKey)
+
             AiProvider.OPENAI -> editor.putString(ApiProvider.OPENAI.preferenceKey, apiKey)
+
+            AiProvider.ANTHROPIC -> editor.putString(ApiProvider.CLAUDE.preferenceKey, apiKey)
+
+            AiProvider.OPENCODE,
             AiProvider.GEMINI,
             AiProvider.GROQ,
             AiProvider.DEEPSEEK,
@@ -72,7 +81,12 @@ class ApiKeyStore(context: Context) {
             AiProvider.OPENROUTER -> editor
                 .remove(ApiProvider.OPENROUTER.preferenceKey)
                 .remove(API_KEY)
+
             AiProvider.OPENAI -> editor.remove(ApiProvider.OPENAI.preferenceKey)
+
+            AiProvider.ANTHROPIC -> editor.remove(ApiProvider.CLAUDE.preferenceKey)
+
+            AiProvider.OPENCODE,
             AiProvider.GEMINI,
             AiProvider.GROQ,
             AiProvider.DEEPSEEK,
@@ -87,12 +101,17 @@ class ApiKeyStore(context: Context) {
         return when (provider) {
             AiProvider.OPENROUTER -> getApiKey(ApiProvider.OPENROUTER)
             AiProvider.OPENAI -> getApiKey(ApiProvider.OPENAI)
+            AiProvider.ANTHROPIC -> getApiKey(ApiProvider.CLAUDE)
+            AiProvider.OPENCODE,
             AiProvider.GEMINI,
             AiProvider.GROQ,
             AiProvider.DEEPSEEK,
             -> null
         }
     }
+
+    fun isConfigured(provider: AiProvider): Boolean =
+        !getApiKey(provider).isNullOrBlank()
 
     fun getProviderConfig(provider: AiProvider): ProviderKeyConfig =
         ProviderKeyConfig(
@@ -101,26 +120,31 @@ class ApiKeyStore(context: Context) {
             isEnabled = preferences.getBoolean(providerEnabledKey(provider), true),
         )
 
-    fun getEnabledProviderConfigs(primaryProvider: AiProvider): List<ProviderKeyConfig> =
-        listOf(getProviderConfig(primaryProvider)) + AiProvider.entries
-            .filter { it != primaryProvider }
-            .map(::getProviderConfig)
-            .filter { it.isEnabled && it.apiKey.isNotBlank() }
+    /**
+     * The selected provider comes first when it has a key. Providers without a
+     * saved key are skipped so an empty primary slot cannot disable failover.
+     */
+    fun getEnabledProviderConfigs(primaryProvider: AiProvider): List<ProviderKeyConfig> {
+        val primary = getProviderConfig(primaryProvider)
+        return buildList {
+            if (primary.apiKey.isNotBlank()) add(primary)
+            AiProvider.entries
+                .asSequence()
+                .filter { it != primaryProvider }
+                .map(::getProviderConfig)
+                .filter { it.isEnabled && it.apiKey.isNotBlank() }
+                .forEach(::add)
+        }.distinctBy(ProviderKeyConfig::provider)
+    }
 
-    fun getSelectedAiProvider(): AiProvider =
-        AiProvider.entries.firstOrNull {
-            it.name == preferences.getString(SELECTED_AI_PROVIDER, null)
-        } ?: AiProvider.OPENROUTER
+    fun getSelectedAiProvider(): AiProvider {
+        val stored = preferences.getString(SELECTED_AI_PROVIDER, null)
+        AiProvider.entries.firstOrNull { it.name == stored }?.let { return it }
+        return AiProvider.entries.firstOrNull(::isConfigured) ?: AiProvider.OPENROUTER
+    }
 
     fun setSelectedAiProvider(provider: AiProvider) {
         preferences.edit().putString(SELECTED_AI_PROVIDER, provider.name).apply()
-    }
-
-    fun getAiModel(provider: AiProvider): String? =
-        preferences.getString(aiModelKey(provider), null)
-
-    fun saveAiModel(provider: AiProvider, model: String) {
-        preferences.edit().putString(aiModelKey(provider), model).apply()
     }
 
     fun getApiKey(): String? =
@@ -145,9 +169,6 @@ class ApiKeyStore(context: Context) {
 
     private fun providerKey(provider: AiProvider): String =
         "ai_${provider.name.lowercase()}_api_key"
-
-    private fun aiModelKey(provider: AiProvider): String =
-        "ai_${provider.name.lowercase()}_model"
 
     private fun providerEnabledKey(provider: AiProvider): String =
         "ai_${provider.name.lowercase()}_enabled"

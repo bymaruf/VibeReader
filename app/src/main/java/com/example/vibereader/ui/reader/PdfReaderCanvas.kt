@@ -48,12 +48,13 @@ fun PdfReaderCanvas(
     ) -> Unit,
     onCanvasTap: () -> Unit,
     onTextLongPress: (pageIndex: Int, xFraction: Float, yFraction: Float) -> Unit,
-    onSelectionHandleDragEnd: (
+    onSelectionHandleDrag: (
         pageIndex: Int,
         isStartHandle: Boolean,
         xFraction: Float,
         yFraction: Float,
     ) -> Unit,
+    onHighlightTap: (com.example.vibereader.data.room.HighlightEntity) -> Unit,
 ) {
     val pagerState = rememberPagerState(pageCount = { pageCount })
     val listState = rememberLazyListState()
@@ -112,10 +113,11 @@ fun PdfReaderCanvas(
                 onRenderPage = onRenderPage,
                 onCanvasTap = onCanvasTap,
                 onTextLongPress = onTextLongPress,
-                onSelectionHandleDragEnd = onSelectionHandleDragEnd,
+                onSelectionHandleDrag = onSelectionHandleDrag,
                 onZoomChanged = { zoomScale ->
                     updateZoom(pageIndex, zoomScale > 1f)
                 },
+                onHighlightTap = onHighlightTap,
             )
         }
 
@@ -144,10 +146,11 @@ fun PdfReaderCanvas(
                         onRenderPage = onRenderPage,
                         onCanvasTap = onCanvasTap,
                         onTextLongPress = onTextLongPress,
-                        onSelectionHandleDragEnd = onSelectionHandleDragEnd,
+                        onSelectionHandleDrag = onSelectionHandleDrag,
                         onZoomChanged = { zoomScale ->
                             updateZoom(pageIndex, zoomScale > 1f)
                         },
+                        onHighlightTap = onHighlightTap,
                     )
                 }
             }

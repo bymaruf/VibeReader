@@ -3,7 +3,13 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Required Permissions for Wallpaper Management & Background Execution -->
     <uses-permission android:name="android.permission.SET_WALLPAPER" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
+        android:required="false" />
     <uses-permission
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
@@ -11,7 +17,17 @@
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
 
+    <!-- Android 11+ package visibility: needed to list dictionary apps that
+         handle ACTION_PROCESS_TEXT in Settings. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT" />
+            <data android:mimeType="text/plain" />
+        </intent>
+    </queries>
+
     <application
+        android:name=".VibeReaderApplication"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -53,12 +69,19 @@
                 android:name="android.service.wallpaper"
                 android:resource="@xml/quote_wallpaper" />
         </service>
+
+        <!-- Handles BOOT_COMPLETED to restore wallpaper scheduling after reboot.
+             ACTION_USER_PRESENT is also declared defensively, but on Android 8+
+             it is not reliably delivered to manifest receivers; the app also
+             registers this receiver dynamically while the process is alive. -->
         <receiver
-            android:name=".service.WallpaperUnlockReceiver"
+            android:name=".service.UnlockReceiver"
             android:enabled="true"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.USER_PRESENT" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
     </application>

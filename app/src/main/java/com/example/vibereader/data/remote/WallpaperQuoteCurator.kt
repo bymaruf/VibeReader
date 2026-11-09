@@ -2,12 +2,10 @@ package com.example.vibereader.data.remote
 
 import android.content.Context
 import com.example.vibereader.core.secure_storage.ApiKeyStore
+import com.example.vibereader.data.local.AiKeyVault
 import com.example.vibereader.domain.QuoteQualityValidator
 import com.example.vibereader.model.AiProvider
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -38,6 +36,12 @@ class WallpaperQuoteCurator(context: Context) {
             setupFailure = error
             null
         }
+        val keyVault = try {
+            AiKeyVault(appContext)
+        } catch (error: Exception) {
+            setupFailure = error
+            null
+        }
         val configs = try {
             apiKeyStore
                 ?.getEnabledProviderConfigs(apiKeyStore.getSelectedAiProvider())
@@ -51,7 +55,9 @@ class WallpaperQuoteCurator(context: Context) {
         var aiFailure: Exception? = null
         for (config in configs) {
             try {
-                val model = apiKeyStore?.getAiModel(config.provider)
+                // Model selection is persisted per provider in DataStore; key/failover
+                // routing (configs above) is unchanged.
+                val model = keyVault?.getAiModel(config.provider)
                     ?.takeIf(String::isNotBlank)
                     ?: config.provider.defaultModel
                 return CuratedWallpaperQuote(
@@ -97,7 +103,7 @@ class WallpaperQuoteCurator(context: Context) {
             .asSequence()
             .map(String::trim)
 
-    private fun requestCuratedCandidate(
+    private suspend fun requestCuratedCandidate(
         provider: AiProvider,
         apiKey: String,
         model: String,
@@ -116,40 +122,16 @@ class WallpaperQuoteCurator(context: Context) {
             .put("bookAuthor", bookAuthor.orEmpty())
             .put("candidates", JSONArray(candidates))
             .toString()
-        val payload = JSONObject()
-            .put("model", model)
-            .put("temperature", 0.1)
-            .put("max_tokens", 40)
-            .put(
-                "messages",
-                JSONArray()
-                    .put(JSONObject().put("role", "system").put("content", systemPrompt))
-                    .put(JSONObject().put("role", "user").put("content", userContent)),
-            )
-        val request = Request.Builder()
-            .url("${provider.baseUrl.trimEnd('/')}/chat/completions")
-            .header("Authorization", "Bearer $apiKey")
-            .apply {
-                if (provider == AiProvider.OPENROUTER) {
-                    header("HTTP-Referer", APP_REFERER)
-                    header("X-Title", APP_TITLE)
-                }
-            }
-            .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
-            .build()
-
-        val responseText = httpClient.newCall(request).execute().use { response ->
-            val body = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw IOException("${provider.displayName} returned HTTP ${response.code}: ${body.take(MAX_ERROR_CHARS)}")
-            }
-            JSONObject(body)
-                .getJSONArray("choices")
-                .getJSONObject(0)
-                .getJSONObject("message")
-                .getString("content")
-                .trim()
-        }
+        val responseText = AiProviderClient.executeChat(
+            client = httpClient,
+            provider = provider,
+            apiKey = apiKey,
+            model = model,
+            systemPrompt = systemPrompt,
+            userContent = userContent,
+            maxTokens = MAX_QUOTE_TOKENS,
+            temperature = 0.1,
+        )
         val index = JSONObject(responseText).getInt("index")
         val selected = candidates.getOrNull(index)
             ?: throw IOException("The AI provider selected an invalid quote candidate.")
@@ -170,13 +152,10 @@ class WallpaperQuoteCurator(context: Context) {
     companion object {
         private const val MAX_CANDIDATES = 100
         private const val MAX_CANDIDATE_CHARS = 600
-        private const val MAX_ERROR_CHARS = 500
+        private const val MAX_QUOTE_TOKENS = 40
         private const val REQUEST_TIMEOUT_SECONDS = 20L
-        private const val APP_REFERER = "https://github.com/VibeReader"
-        private const val APP_TITLE = "VibeReader"
         private val WHITESPACE = Regex("""\s+""")
         private val SENTENCE_BOUNDARY = Regex("""(?<=[.!?])\s+""")
-        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
 }
 

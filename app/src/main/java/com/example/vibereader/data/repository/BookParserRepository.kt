@@ -5,42 +5,30 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.room.withTransaction
 import com.example.vibereader.core.database.VibeReaderDatabase
+import com.example.vibereader.data.document.EBookDocumentLoader
 import com.example.vibereader.data.room.BookChapterEntity
 import com.example.vibereader.data.room.BookEntity
-import com.example.vibereader.util.CoverExtractor
-import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
-import com.tom_roush.pdfbox.pdmodel.PDDocument
-import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.example.vibereader.domain.model.EBookFormat
+import com.example.vibereader.util.FilenameSanitizer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
-import org.jsoup.parser.Parser
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.IOException
-import java.nio.charset.StandardCharsets
 import java.util.UUID
-import java.util.zip.ZipFile
 
 class BookParserRepository(
     context: Context,
     private val database: VibeReaderDatabase,
 ) {
     private val appContext = context.applicationContext
+    private val documentLoader = EBookDocumentLoader(appContext)
 
     suspend fun ensureCoverImage(book: BookEntity) {
         if (book.coverImagePath?.let(::File)?.isFile == true) return
         val sourceFile = File(book.filePath).takeIf(File::isFile) ?: return
-        val format = when (book.format.uppercase()) {
-            BookFormat.PDF.label -> BookFormat.PDF
-            BookFormat.EPUB.label -> BookFormat.EPUB
-            else -> return
-        }
-        val coverPath = withContext(Dispatchers.IO) {
-            CoverExtractor.extractCover(appContext, sourceFile, format)
-        } ?: return
+        val format = EBookFormat.fromLabel(book.format) ?: return
+        val coverPath = documentLoader.extractCover(sourceFile, format) ?: return
         database.bookDao().updateCoverImagePath(book.id, coverPath)
     }
 
@@ -52,13 +40,8 @@ class BookParserRepository(
     ): BookEntity = withContext(Dispatchers.IO) {
         val displayName = queryDisplayName(uri)
         val mimeType = appContext.contentResolver.getType(uri)
-        val format = when {
-            displayName.endsWith(".pdf", ignoreCase = true) ||
-                mimeType == "application/pdf" -> BookFormat.PDF
-            displayName.endsWith(".epub", ignoreCase = true) ||
-                mimeType == "application/epub+zip" -> BookFormat.EPUB
-            else -> throw IOException("Choose a PDF or EPUB file.")
-        }
+        val format = EBookFormat.detect(displayName, mimeType)
+            ?: throw IOException("Choose a PDF or EPUB file.")
 
         val bookId = UUID.randomUUID().toString()
         val booksDirectory = File(appContext.filesDir, BOOKS_DIRECTORY)
@@ -74,27 +57,37 @@ class BookParserRepository(
                 throw IOException("Could not finish saving the imported book.")
             }
 
-            val parsedBook = when (format) {
-                BookFormat.PDF -> parsePdf(destination, displayName)
-                BookFormat.EPUB -> parseEpub(destination, displayName)
+            val document = withTimeoutOrNull(IMPORT_TIMEOUT_MS) {
+                documentLoader.loadDocument(
+                    bookId = bookId,
+                    file = destination,
+                    format = format,
+                    fallbackTitle = displayName,
+                )
+            } ?: throw IOException("Timed out while reading this book.")
+
+            val coverImagePath = withTimeoutOrNull(COVER_TIMEOUT_MS) {
+                documentLoader.extractCover(destination, format)
             }
             val book = BookEntity(
                 id = bookId,
-                title = parsedBook.title.ifBlank { displayName.withoutExtension() },
-                author = parsedBook.author?.takeIf(String::isNotBlank),
+                title = FilenameSanitizer.cleanBookTitle(
+                    document.title.ifBlank { displayName },
+                ).ifBlank { "Untitled Book" },
+                author = document.author?.takeIf(String::isNotBlank),
                 documentUri = uri.toString(),
                 format = format.label,
                 filePath = destination.absolutePath,
                 fileSizeBytes = destination.length(),
-                coverImagePath = CoverExtractor.extractCover(appContext, destination, format),
+                coverImagePath = coverImagePath,
                 sourceModifiedAt = sourceModifiedAt,
                 isDeviceScanned = isDeviceScanned,
                 scanSource = scanSource,
             )
-            val chapters = parsedBook.chapters.mapIndexed { index, chapter ->
+            val chapters = document.chapters.map { chapter ->
                 BookChapterEntity(
                     bookId = bookId,
-                    chapterIndex = index,
+                    chapterIndex = chapter.chapterIndex,
                     title = chapter.title,
                     text = chapter.text,
                 )
@@ -113,11 +106,8 @@ class BookParserRepository(
     }
 
     suspend fun processScannedBook(book: BookEntity, sourceUri: Uri): BookEntity {
-        val format = when (book.format.uppercase()) {
-            BookFormat.PDF.label -> BookFormat.PDF
-            BookFormat.EPUB.label -> BookFormat.EPUB
-            else -> throw IOException("Unsupported scanned book format: ${book.format}")
-        }
+        val format = EBookFormat.fromLabel(book.format)
+            ?: throw IOException("Unsupported scanned book format: ${book.format}")
         val booksDirectory = File(appContext.filesDir, BOOKS_DIRECTORY)
         if (!booksDirectory.exists() && !booksDirectory.mkdirs()) {
             throw IOException("Could not create the local books directory.")
@@ -136,25 +126,32 @@ class BookParserRepository(
                     throw IOException("Could not finish saving the scanned book.")
                 }
             }
-            val parsedBook = withContext(Dispatchers.Default) {
-                when (format) {
-                    BookFormat.PDF -> parsePdf(destination, book.title)
-                    BookFormat.EPUB -> parseEpub(destination, book.title)
-                }
+            val document = withContext(Dispatchers.IO) {
+                documentLoader.loadDocument(
+                    bookId = book.id,
+                    file = destination,
+                    format = format,
+                    fallbackTitle = book.title,
+                )
+            }
+            // Covers are optional. A missing or slow thumbnail falls back to the
+            // existing cover instead of failing the whole book.
+            val coverImagePath = withTimeoutOrNull(COVER_TIMEOUT_MS) {
+                documentLoader.extractCover(destination, format)
             }
             val processedBook = book.copy(
-                title = parsedBook.title.ifBlank { book.title },
-                author = parsedBook.author?.takeIf(String::isNotBlank),
+                title = FilenameSanitizer.cleanBookTitle(
+                    document.title.ifBlank { book.title },
+                ).ifBlank { "Untitled Book" },
+                author = document.author?.takeIf(String::isNotBlank),
                 filePath = destination.absolutePath,
                 fileSizeBytes = destination.length(),
-                coverImagePath = withContext(Dispatchers.IO) {
-                    CoverExtractor.extractCover(appContext, destination, format)
-                },
+                coverImagePath = coverImagePath ?: book.coverImagePath,
             )
-            val chapters = parsedBook.chapters.mapIndexed { index, chapter ->
+            val chapters = document.chapters.map { chapter ->
                 BookChapterEntity(
                     bookId = book.id,
-                    chapterIndex = index,
+                    chapterIndex = chapter.chapterIndex,
                     title = chapter.title,
                     text = chapter.text,
                 )
@@ -209,188 +206,9 @@ class BookParserRepository(
         }
     }
 
-    private fun parsePdf(file: File, fallbackTitle: String): ParsedBook {
-        PDFBoxResourceLoader.init(appContext)
-        PDDocument.load(file).use { document ->
-            val info = document.documentInformation
-            val text = PDFTextStripper().getText(document).trim()
-            return ParsedBook(
-                title = info.title?.takeIf(String::isNotBlank) ?: fallbackTitle.withoutExtension(),
-                author = info.author,
-                chapters = listOf(ParsedChapter("Full text", text)),
-            )
-        }
-    }
-
-    private fun parseEpub(file: File, fallbackTitle: String): ParsedBook {
-        ZipFile(file).use { epub ->
-            val containerEntry = epub.getEntry(CONTAINER_PATH)
-                ?: throw IOException("This EPUB has no package descriptor.")
-            val container = parseXml(readEntry(epub, containerEntry))
-            val rootFile = container.select("*").firstOrNull {
-                it.normalizedTagName() == "rootfile"
-            }
-                ?: throw IOException("This EPUB has an invalid package descriptor.")
-            val packagePath = rootFile.attr("full-path")
-            val packageEntry = epub.getEntry(packagePath)
-                ?: throw IOException("This EPUB package file is missing.")
-            val packageDocument = parseXml(readEntry(epub, packageEntry))
-            val metadata = packageDocument.select("*").firstOrNull {
-                it.normalizedTagName() == "metadata"
-            }
-            val title = metadata?.firstDescendantText("title")
-                ?: fallbackTitle.withoutExtension()
-            val author = metadata?.firstDescendantText("creator")
-            val manifestItems = packageDocument.select("*").filter {
-                it.normalizedTagName() == "item"
-            }
-            val manifest = buildMap {
-                manifestItems.forEach { item ->
-                    put(item.attr("id"), item.attr("href"))
-                }
-            }
-            val orderedPaths = mutableListOf<String>()
-            val spineItems = packageDocument.select("*").filter {
-                it.normalizedTagName() == "itemref"
-            }
-            for (item in spineItems) {
-                manifest[item.attr("idref")]?.let { href ->
-                    resolveArchivePath(packagePath, href)?.let(orderedPaths::add)
-                }
-            }
-
-            val fallbackPaths = listZipEntryPaths(epub).filter(::isHtmlPath)
-            val chapterPaths = (orderedPaths + fallbackPaths).distinct()
-            if (chapterPaths.none { epub.getEntry(it) != null }) {
-                throw IOException("No readable chapters were found in this EPUB.")
-            }
-            if (chapterPaths.size > MAX_CHAPTERS) {
-                throw IOException("This EPUB contains too many chapters to import.")
-            }
-
-            var totalTextBytes = 0L
-            val chapters = chapterPaths.mapNotNull { path ->
-                val entry = epub.getEntry(path) ?: return@mapNotNull null
-                if (!isHtmlPath(path)) return@mapNotNull null
-                val chapterDocument = parseChapter(readEntry(epub, entry))
-                val text = (chapterDocument.body()?.text().orEmpty())
-                    .ifBlank { chapterDocument.text() }
-                    .trim()
-                if (text.isBlank()) return@mapNotNull null
-                totalTextBytes += text.toByteArray(StandardCharsets.UTF_8).size
-                if (totalTextBytes > MAX_TOTAL_TEXT_BYTES) {
-                    throw IOException("The extracted EPUB text is too large to import.")
-                }
-                val chapterTitle = chapterDocument.selectFirst("h1, h2, title")
-                    ?.text()
-                    ?.takeIf(String::isNotBlank)
-                    ?: "Chapter ${chaptersTitleIndex(chapterPaths, path) + 1}"
-                ParsedChapter(chapterTitle, text)
-            }
-            if (chapters.isEmpty()) {
-                throw IOException("No readable text was found in this EPUB.")
-            }
-            return ParsedBook(title, author, chapters)
-        }
-    }
-
-    private fun parseChapter(bytes: ByteArray): Document {
-        val document = Jsoup.parse(
-            ByteArrayInputStream(bytes),
-            StandardCharsets.UTF_8.name(),
-            "",
-            Parser.xmlParser(),
-        )
-        document.select("script, style, link[rel=stylesheet], nav").remove()
-        document.select("*").forEach { element ->
-            element.removeAttr("style")
-            element.removeAttr("class")
-        }
-        return document
-    }
-
-    private fun parseXml(bytes: ByteArray): Document = Jsoup.parse(
-        ByteArrayInputStream(bytes),
-        StandardCharsets.UTF_8.name(),
-        "",
-        Parser.xmlParser(),
-    )
-
-    private fun readEntry(zip: ZipFile, entry: java.util.zip.ZipEntry): ByteArray {
-        if (entry.size > MAX_ARCHIVE_ENTRY_BYTES) {
-            throw IOException("An EPUB component is too large to import.")
-        }
-        val output = ByteArrayOutputStream()
-        zip.getInputStream(entry).use { input ->
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            var total = 0L
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                total += count
-                if (total > MAX_ARCHIVE_ENTRY_BYTES) {
-                    throw IOException("An EPUB component is too large to import.")
-                }
-                output.write(buffer, 0, count)
-            }
-        }
-        return output.toByteArray()
-    }
-
-    private fun resolveArchivePath(packagePath: String, href: String): String? {
-        val cleanHref = href.substringBefore('#').substringBefore('?')
-        val resolved = java.net.URI(packagePath).resolve(cleanHref).normalize().path
-            .removePrefix("/")
-        if (resolved.isBlank() || resolved == ".." || resolved.startsWith("../")) return null
-        return resolved
-    }
-
-    private fun org.jsoup.nodes.Element.firstDescendantText(localName: String): String? =
-        select("*")
-            .firstOrNull { it.normalizedTagName() == localName }
-            ?.text()
-            ?.trim()
-            ?.takeIf(String::isNotBlank)
-
-    private fun org.jsoup.nodes.Element.normalizedTagName(): String =
-        tagName().substringAfter(':').lowercase()
-
-    private fun isHtmlPath(path: String): Boolean =
-        path.endsWith(".xhtml", true) || path.endsWith(".html", true) ||
-            path.endsWith(".htm", true)
-
-    private fun chaptersTitleIndex(paths: List<String>, currentPath: String): Int =
-        paths.takeWhile { it != currentPath }.count(::isHtmlPath)
-
-    private fun listZipEntryPaths(zip: ZipFile): List<String> {
-        val paths = mutableListOf<String>()
-        val entries = zip.entries()
-        while (entries.hasMoreElements()) {
-            val name = entries.nextElement().name
-            if (!name.endsWith("/")) paths += name
-            if (paths.size > MAX_ARCHIVE_ENTRIES) {
-                throw IOException("This EPUB contains too many archive entries.")
-            }
-        }
-        return paths
-    }
-
-    private fun String.withoutExtension(): String = substringBeforeLast('.', this)
-
-    private data class ParsedBook(
-        val title: String,
-        val author: String?,
-        val chapters: List<ParsedChapter>,
-    )
-
-    private data class ParsedChapter(val title: String, val text: String)
-
     private companion object {
         const val BOOKS_DIRECTORY = "books"
-        const val CONTAINER_PATH = "META-INF/container.xml"
-        const val MAX_ARCHIVE_ENTRY_BYTES = 16L * 1024 * 1024
-        const val MAX_TOTAL_TEXT_BYTES = 128L * 1024 * 1024
-        const val MAX_CHAPTERS = 2_000
-        const val MAX_ARCHIVE_ENTRIES = 20_000
+        const val IMPORT_TIMEOUT_MS = 60_000L
+        const val COVER_TIMEOUT_MS = 2_000L
     }
 }

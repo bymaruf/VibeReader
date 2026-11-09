@@ -36,12 +36,13 @@ fun PdfPageRenderer(
     ) -> Unit,
     onCanvasTap: () -> Unit,
     onTextLongPress: (pageIndex: Int, xFraction: Float, yFraction: Float) -> Unit,
-    onSelectionHandleDragEnd: (
+    onSelectionHandleDrag: (
         pageIndex: Int,
         isStartHandle: Boolean,
         xFraction: Float,
         yFraction: Float,
     ) -> Unit,
+    onHighlightTap: (com.example.vibereader.data.room.HighlightEntity) -> Unit,
     onZoomChanged: (Float) -> Unit,
 ) {
     val backgroundColor = when (theme) {
@@ -104,7 +105,8 @@ fun PdfPageRenderer(
                     fitToBounds = fitToBounds,
                     onCanvasTap = onCanvasTap,
                     onTextLongPress = onTextLongPress,
-                    onSelectionHandleDragEnd = onSelectionHandleDragEnd,
+                    onSelectionHandleDrag = onSelectionHandleDrag,
+                    onHighlightTap = onHighlightTap,
                     onZoomChanged = { zoomScale ->
                         onZoomChanged(zoomScale)
                         if (availableWidthPx > 0) {

@@ -34,7 +34,7 @@ import com.example.vibereader.data.room.AppThemePreferenceEntity
         AppThemePreferenceEntity::class,
         BookReadingThemeEntity::class,
     ],
-    version = 9,
+    version = 14,
     exportSchema = true,
 )
 abstract class VibeReaderDatabase : RoomDatabase() {
@@ -164,6 +164,122 @@ abstract class VibeReaderDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Universal highlight location. Existing PDF highlights are
+                // backfilled from their page/character fields.
+                db.execSQL(
+                    "ALTER TABLE highlights ADD COLUMN chapterIndex INTEGER NOT NULL DEFAULT 0",
+                )
+                db.execSQL(
+                    "ALTER TABLE highlights ADD COLUMN characterOffset INTEGER NOT NULL DEFAULT 0",
+                )
+                db.execSQL(
+                    "ALTER TABLE highlights ADD COLUMN endCharacterOffset INTEGER NOT NULL DEFAULT 0",
+                )
+                db.execSQL(
+                    """
+                    UPDATE highlights SET
+                        chapterIndex = COALESCE(pageIndex, 0),
+                        characterOffset = CASE
+                            WHEN startCharOffset != 0 THEN startCharOffset
+                            ELSE startOffset
+                        END,
+                        endCharacterOffset = CASE
+                            WHEN endCharOffset != 0 THEN endCharOffset
+                            ELSE endOffset
+                        END
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_highlights_bookId_chapterIndex " +
+                        "ON highlights(bookId, chapterIndex)",
+                )
+
+                // Universal quote location.
+                db.execSQL(
+                    "ALTER TABLE quotes ADD COLUMN chapterIndex INTEGER NOT NULL DEFAULT 0",
+                )
+                db.execSQL(
+                    "ALTER TABLE quotes ADD COLUMN characterOffset INTEGER NOT NULL DEFAULT 0",
+                )
+                db.execSQL(
+                    "ALTER TABLE quotes ADD COLUMN endCharacterOffset INTEGER NOT NULL DEFAULT 0",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_quotes_bookId_chapterIndex " +
+                        "ON quotes(bookId, chapterIndex)",
+                )
+            }
+        }
+
+        private val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Human-in-the-loop wallpaper curation: existing quotes start
+                // unapproved until the user explicitly ticks them.
+                db.execSQL(
+                    "ALTER TABLE quotes ADD COLUMN isApprovedForWallpaper " +
+                        "INTEGER NOT NULL DEFAULT 0",
+                )
+            }
+        }
+
+        private val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Persisted origin so user highlights and AI suggestions can be
+                // listed separately. Existing rows are treated as user-saved,
+                // the safest possible default.
+                db.execSQL(
+                    "ALTER TABLE quotes ADD COLUMN source TEXT NOT NULL DEFAULT 'USER'",
+                )
+            }
+        }
+
+        private val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Historical repair: attempted to reclassify legacy AI quotes.
+                // Its chapter==book.title heuristic can misclassify user-saved
+                // quotes, so 13->14 reverses this specific unsafe change.
+                db.execSQL(
+                    """
+                    UPDATE quotes
+                    SET source = 'AI'
+                    WHERE source = 'USER'
+                        AND chapter IS NOT NULL
+                        AND EXISTS (
+                            SELECT 1
+                            FROM books b
+                            WHERE b.id = quotes.bookId
+                                AND lower(trim(b.title)) = lower(trim(quotes.chapter))
+                        )
+                    """.trimIndent(),
+                )
+            }
+        }
+
+        private val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Reverse 12->13: "chapter == book title" is not a reliable marker
+                // (manual saves may use the document/chapter title). Defaulting
+                // ambiguous rows back to USER is safer; new AI fetches always set
+                // source=AI explicitly via QuoteRepository.appendAiQuotes().
+                db.execSQL(
+                    """
+                    UPDATE quotes
+                    SET source = 'USER'
+                    WHERE source = 'AI'
+                        AND chapter IS NOT NULL
+                        AND EXISTS (
+                            SELECT 1
+                            FROM books b
+                            WHERE b.id = quotes.bookId
+                                AND lower(trim(b.title)) = lower(trim(quotes.chapter))
+                        )
+                    """.trimIndent(),
+                )
+            }
+        }
+
         @Volatile
         private var instance: VibeReaderDatabase? = null
 
@@ -182,6 +298,11 @@ abstract class VibeReaderDatabase : RoomDatabase() {
                     MIGRATION_6_7,
                     MIGRATION_7_8,
                     MIGRATION_8_9,
+                    MIGRATION_9_10,
+                    MIGRATION_10_11,
+                    MIGRATION_11_12,
+                    MIGRATION_12_13,
+                    MIGRATION_13_14,
                 )
                     .build()
                     .also { instance = it }

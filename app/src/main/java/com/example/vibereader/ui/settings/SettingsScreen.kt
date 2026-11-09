@@ -1,74 +1,88 @@
 package com.example.vibereader.ui.settings
 
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExposedDropdownMenuBox
-import androidx.compose.material3.ExposedDropdownMenuDefaults
-import androidx.compose.material3.ExposedDropdownMenuAnchorType
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.graphics.Shape
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.painter.BitmapPainter
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.vibereader.core.database.VibeReaderDatabase
-import com.example.vibereader.core.secure_storage.ApiKeyStore
 import com.example.vibereader.core.theme.ThemeOption
+import com.example.vibereader.data.local.DictionaryPreferences
 import com.example.vibereader.data.local.WallpaperPreferences
+import com.example.vibereader.data.local.WallpaperSettings
 import com.example.vibereader.data.local.WallpaperTarget
-import com.example.vibereader.data.remote.DiscoveredModel
-import com.example.vibereader.model.AiProvider
-import com.example.vibereader.model.ProviderKeyConfig
 import com.example.vibereader.data.repository.BookParserRepository
 import com.example.vibereader.ui.library.LibraryViewModel
+import com.example.vibereader.util.AppDiscoveryHelper
+import com.example.vibereader.util.AppInfo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 @Composable
-@OptIn(ExperimentalMaterial3Api::class)
 fun SettingsScreen(
-    settingsViewModel: SettingsViewModel,
+    viewModel: SettingsViewModel = run {
+        val context = LocalContext.current
+        val database = remember(context) { VibeReaderDatabase.getInstance(context) }
+        viewModel(
+            factory = remember(context, database) {
+                SettingsViewModel.Factory(database, context.applicationContext)
+            },
+        )
+    },
     contentPadding: PaddingValues = PaddingValues(),
 ) {
     val context = LocalContext.current
@@ -79,54 +93,50 @@ fun SettingsScreen(
         },
     )
     val scanState by libraryViewModel.scanState.collectAsState()
-    val appTheme by settingsViewModel.appTheme.collectAsStateWithLifecycle()
-    val themeError by settingsViewModel.themeError.collectAsStateWithLifecycle()
+    // Safe collection with non-null initial values; never read uninitialized flows.
+    val appTheme by viewModel.appTheme.collectAsStateWithLifecycle(initialValue = ThemeOption.SYSTEM)
+    val themeError by viewModel.themeError.collectAsStateWithLifecycle(initialValue = null)
     val parserRepository = remember(context, database) {
         BookParserRepository(context.applicationContext, database)
     }
-    val apiKeyStore = remember(context) { ApiKeyStore(context.applicationContext) }
-    val modelDiscovery by settingsViewModel.modelDiscovery.collectAsStateWithLifecycle()
-    val wallpaperPreferences = remember(context) { WallpaperPreferences(context.applicationContext) }
+    val wallpaperPreferences = remember(context) {
+        runCatching { WallpaperPreferences(context.applicationContext) }.getOrNull()
+    }
     val coroutineScope = rememberCoroutineScope()
-    var aiProvider by remember(apiKeyStore) { mutableStateOf(apiKeyStore.getSelectedAiProvider()) }
-    var apiKey by remember(apiKeyStore, aiProvider) {
-        mutableStateOf(apiKeyStore.getApiKey(aiProvider).orEmpty())
-    }
-    var isEditingKey by remember(apiKeyStore, aiProvider) {
-        mutableStateOf(apiKeyStore.getApiKey(aiProvider).isNullOrBlank())
-    }
-    var aiModel by remember(apiKeyStore, aiProvider) {
-        mutableStateOf(apiKeyStore.getAiModel(aiProvider) ?: aiProvider.defaultModel)
-    }
-    val discoveredModels = if (modelDiscovery.provider == aiProvider) {
-        modelDiscovery.models
-    } else {
-        emptyList()
-    }
-    var modelMenuExpanded by remember { mutableStateOf(false) }
-    var isSavingApiSettings by remember { mutableStateOf(false) }
-    val isDiscoveringModels = modelDiscovery.isLoading || isSavingApiSettings
-    val modelDiscoveryMessage = modelDiscovery.takeIf { it.provider == aiProvider }?.message
-    var fallbackEnabled by remember(apiKeyStore) {
+    var wallpaperSettings by remember(wallpaperPreferences) {
         mutableStateOf(
-            AiProvider.entries.associateWith { provider ->
-                apiKeyStore.getProviderConfig(provider).isEnabled
-            },
+            runCatching { wallpaperPreferences?.getSettings() }.getOrNull() ?: WallpaperSettings(),
         )
     }
-    var providerMenuExpanded by remember { mutableStateOf(false) }
+    var wallpaperTargetMenuExpanded by remember { mutableStateOf(false) }
+    val dictionaryPreferences = remember(context) {
+        runCatching { DictionaryPreferences(context.applicationContext) }.getOrNull()
+    }
+    var customDictionaryPackage by remember(dictionaryPreferences) {
+        mutableStateOf(
+            runCatching { dictionaryPreferences?.getCustomDictionaryPackage() }.getOrNull(),
+        )
+    }
+    var dictionaryMenuExpanded by remember { mutableStateOf(false) }
+    val dictionaryApps by produceState<List<AppInfo>?>(initialValue = null) {
+        value = runCatching {
+            withContext(Dispatchers.IO) {
+                AppDiscoveryHelper.getAvailableDictionaryApps(context)
+            }
+        }.getOrDefault(emptyList())
+    }
+    val installedDictionaryApps = (dictionaryApps ?: emptyList()).filterNotNull()
+    val selectedDictionaryLabel = when {
+        customDictionaryPackage.isNullOrBlank() -> "Google Search (default)"
+        dictionaryApps == null -> "Loading…"
+        else -> installedDictionaryApps
+            .firstOrNull { it.packageName == customDictionaryPackage }
+            ?.appName
+            ?: "Selected app unavailable"
+    }
     var message by remember { mutableStateOf<String?>(null) }
     var isImporting by remember { mutableStateOf(false) }
     var showImportOptions by remember { mutableStateOf(false) }
-    var wallpaperSettings by remember(wallpaperPreferences) {
-        mutableStateOf(wallpaperPreferences.getSettings())
-    }
-    LaunchedEffect(aiProvider, modelDiscovery.selectedModel, modelDiscovery.provider) {
-        if (modelDiscovery.provider == aiProvider) {
-            modelDiscovery.selectedModel?.takeIf(String::isNotBlank)?.let { aiModel = it }
-        }
-    }
-    var wallpaperTargetMenuExpanded by remember { mutableStateOf(false) }
 
     val documentPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
@@ -152,14 +162,14 @@ fun SettingsScreen(
         contract = ActivityResultContracts.OpenDocumentTree(),
     ) { uri ->
         if (uri != null) {
-            try {
+            runCatching {
                 context.contentResolver.takePersistableUriPermission(
                     uri,
                     Intent.FLAG_GRANT_READ_URI_PERMISSION,
                 )
                 libraryViewModel.saveFolderAccess(uri)
                 message = "Folder access saved. Scanning the selected folder."
-            } catch (error: SecurityException) {
+            }.onFailure { error ->
                 message = error.localizedMessage ?: "Folder access could not be saved."
             }
         }
@@ -169,23 +179,108 @@ fun SettingsScreen(
         modifier = Modifier
             .padding(contentPadding)
             .verticalScroll(rememberScrollState())
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+            .animateContentSize(),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("SETTINGS", style = MaterialTheme.typography.headlineSmall)
-        StorageSettingsCard(
-            isImporting = isImporting,
-            isScanning = scanState.isScanning,
-            isProcessingMetadata = scanState.isProcessingMetadata,
-            statusMessage = scanState.statusMessage,
-            errorMessage = scanState.errorMessage,
-            onImportBooksClicked = { showImportOptions = true },
-            onRescanClicked = libraryViewModel::scanDeviceForBooks,
+        Text(
+            text = "SETTINGS",
+            style = MaterialTheme.typography.headlineSmall,
+            letterSpacing = 1.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(start = 4.dp, bottom = 4.dp),
         )
+
+        SettingsCard("STORAGE & BOOKS") {
+            Text(
+                text = "Import PDF or EPUB files, or rescan your device library.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            SettingsPrimaryButton(
+                text = if (isImporting) "Importing books…" else "Import Books (PDF / EPUB)",
+                onClick = { showImportOptions = true },
+                enabled = !isImporting,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedButton(
+                    onClick = libraryViewModel::scanDeviceForBooks,
+                    enabled = !scanState.isScanning && !scanState.isProcessingMetadata,
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(
+                        width = 1.dp,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
+                    ),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                    ),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 9.dp),
+                ) {
+                    Text(
+                        text = if (scanState.isScanning) "Scanning…" else "Rescan Library",
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                }
+            }
+            AnimatedVisibility(
+                visible = scanState.isScanning ||
+                    scanState.isProcessingMetadata ||
+                    scanState.statusMessage != null ||
+                    scanState.errorMessage != null,
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut(),
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (scanState.isScanning || scanState.isProcessingMetadata) {
+                        Text(
+                            text = scanState.statusMessage ?: "Updating your library…",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        scanState.statusMessage?.let { status ->
+                            Text(
+                                text = status,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    scanState.errorMessage?.let { error ->
+                        Text(
+                            text = error,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            }
+        }
+
+        AnimatedVisibility(
+            visible = message != null,
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut(),
+        ) {
+            message?.let { text ->
+                Text(
+                    text = text,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
+            }
+        }
 
         SettingsCard("APPEARANCE & THEME") {
             Text(
-                "Choose the app appearance. Reading canvas themes are set in Reading Settings.",
+                text = "Choose the app appearance. Reading canvas themes are set in Reading Settings.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -195,7 +290,7 @@ fun SettingsScreen(
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                ThemeOption.entries.forEach { option ->
+                ThemeOption.entries.toList().forEach { option ->
                     val label = when (option) {
                         ThemeOption.SYSTEM -> "SYSTEM"
                         ThemeOption.OLED_BLACK -> "OLED NIGHT"
@@ -207,7 +302,7 @@ fun SettingsScreen(
                         targetValue = if (selected) {
                             MaterialTheme.colorScheme.onSurface
                         } else {
-                            MaterialTheme.colorScheme.surfaceVariant
+                            MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.55f)
                         },
                         label = "theme-pill-background",
                     )
@@ -219,380 +314,189 @@ fun SettingsScreen(
                         },
                         label = "theme-pill-foreground",
                     )
+                    val pillBorder by animateColorAsState(
+                        targetValue = if (selected) {
+                            MaterialTheme.colorScheme.onSurface
+                        } else {
+                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+                        },
+                        label = "theme-pill-border",
+                    )
                     Surface(
-                        onClick = { settingsViewModel.setTheme(option) },
+                        onClick = { runCatching { viewModel.setTheme(option) } },
                         shape = RoundedCornerShape(50),
                         color = pillBackground,
                         contentColor = pillForeground,
-                        border = androidx.compose.foundation.BorderStroke(
-                            width = 1.dp,
-                            color = MaterialTheme.colorScheme.outline,
-                        ),
+                        border = BorderStroke(1.dp, pillBorder),
                     ) {
                         Text(
                             text = label,
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
-                            style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                            style = MaterialTheme.typography.labelMedium,
+                            letterSpacing = 0.6.sp,
                             maxLines = 1,
                         )
                     }
-
                 }
             }
-            themeError?.let { error ->
+            AnimatedVisibility(
+                visible = themeError != null,
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut(),
+            ) {
+                themeError?.let { error ->
+                    Text(
+                        text = error,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+        }
+
+        SettingsCard("DICTIONARY") {
+            Text(
+                text = "Select a single word in the reader, then tap 📖 Dictionary. " +
+                    "Choose an installed dictionary or translation app, or leave this on " +
+                    "Google Search to look up the definition.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Box {
+                SettingsPrimaryButton(
+                    text = "Choose dictionary app",
+                    onClick = { dictionaryMenuExpanded = true },
+                )
+                DropdownMenu(
+                    expanded = dictionaryMenuExpanded,
+                    onDismissRequest = { dictionaryMenuExpanded = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Google Search (default)") },
+                        onClick = {
+                            customDictionaryPackage = null
+                            runCatching { dictionaryPreferences?.setCustomDictionaryPackage(null) }
+                            dictionaryMenuExpanded = false
+                        },
+                    )
+                    installedDictionaryApps.forEach { app ->
+                        DropdownMenuItem(
+                            text = { Text(app.appName) },
+                            leadingIcon = {
+                                DictionaryAppIcon(
+                                    app = app,
+                                    modifier = Modifier.size(28.dp),
+                                )
+                            },
+                            onClick = {
+                                customDictionaryPackage = app.packageName
+                                runCatching {
+                                    dictionaryPreferences?.setCustomDictionaryPackage(app.packageName)
+                                }
+                                dictionaryMenuExpanded = false
+                            },
+                        )
+                    }
+                    when {
+                        dictionaryApps == null -> DropdownMenuItem(
+                            text = { Text("Loading installed apps…") },
+                            enabled = false,
+                            onClick = {},
+                        )
+                        installedDictionaryApps.isEmpty() -> DropdownMenuItem(
+                            text = { Text("No dictionary/translation apps found") },
+                            enabled = false,
+                            onClick = {},
+                        )
+                    }
+                }
+            }
+            Text(
+                text = "Current: $selectedDictionaryLabel",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            AnimatedVisibility(
+                visible = !customDictionaryPackage.isNullOrBlank() &&
+                    dictionaryApps != null &&
+                    installedDictionaryApps.none { it.packageName == customDictionaryPackage },
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut(),
+            ) {
                 Text(
-                    error,
-                    color = MaterialTheme.colorScheme.error,
+                    text = "The selected app is no longer installed. The Google fallback will be used.",
                     style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
                 )
             }
         }
 
-        SettingsCard("AI") {
-            Text("Wallpaper target", style = MaterialTheme.typography.labelMedium)
+        SettingsCard("WALLPAPER AI") {
+            Text(
+                text = "Choose where generated reading wallpapers are applied. Quotes are " +
+                    "curated by the connected AI providers.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             Box {
-                Button(onClick = { wallpaperTargetMenuExpanded = true }) {
-                    Text("Apply wallpaper to: ${wallpaperSettings.applyTarget.label}")
-                }
+                SettingsPrimaryButton(
+                    text = "Apply wallpaper to: ${wallpaperSettings.applyTarget.label}",
+                    onClick = { wallpaperTargetMenuExpanded = true },
+                    modifier = Modifier.fillMaxWidth(),
+                )
                 DropdownMenu(
                     expanded = wallpaperTargetMenuExpanded,
                     onDismissRequest = { wallpaperTargetMenuExpanded = false },
                 ) {
-                    WallpaperTarget.entries.forEach { target ->
+                    WallpaperTarget.entries.toList().forEach { target ->
                         DropdownMenuItem(
                             text = { Text(target.label) },
                             onClick = {
-                                wallpaperSettings = wallpaperSettings.copy(applyTarget = target)
-                                wallpaperPreferences.saveSettings(wallpaperSettings)
+                                val prefs = wallpaperPreferences
+                                // Merge into the latest persisted settings so a
+                                // stale snapshot cannot revert the Studio theme.
+                                val latest = runCatching {
+                                    prefs?.getSettings()?.copy(applyTarget = target)
+                                }.getOrNull() ?: wallpaperSettings.copy(applyTarget = target)
+                                wallpaperSettings = latest
+                                runCatching { prefs?.saveSettings(latest) }
                                 wallpaperTargetMenuExpanded = false
                             },
                         )
                     }
                 }
             }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Primary provider", style = MaterialTheme.typography.labelMedium)
-                    Text(
-                        aiProvider.displayName,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                Box {
-                    Button(
-                        onClick = { providerMenuExpanded = true },
-                        enabled = !isDiscoveringModels && !isEditingKey,
-                    ) {
-                        Text("Change")
-                    }
-                DropdownMenu(
-                    expanded = providerMenuExpanded,
-                    onDismissRequest = { providerMenuExpanded = false },
-                ) {
-                    AiProvider.entries.forEach { provider ->
-                        DropdownMenuItem(
-                            text = { Text(provider.displayName) },
-                            onClick = {
-                                aiProvider = provider
-                                apiKey = apiKeyStore.getApiKey(provider).orEmpty()
-                                isEditingKey = apiKey.isBlank()
-                                aiModel = apiKeyStore.getAiModel(provider) ?: provider.defaultModel
-                                settingsViewModel.discoverModels(
-                                    provider,
-                                    apiKey,
-                                )
-                                fallbackEnabled = fallbackEnabled + (provider to true)
-                                providerMenuExpanded = false
-                                message = null
-                            },
-                        )
-                    }
-                }
-                }
-            }
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("API key", style = MaterialTheme.typography.labelMedium)
-                    TextButton(
-                        enabled = !isDiscoveringModels,
-                        onClick = {
-                            if (!isEditingKey) {
-                                isEditingKey = true
-                            } else {
-                                val keyToSave = apiKey.trim()
-                                val providerToSave = aiProvider
-                                isSavingApiSettings = true
-                                coroutineScope.launch {
-                                    try {
-                                        withContext(Dispatchers.IO) {
-                                            if (keyToSave.isBlank()) {
-                                                apiKeyStore.clearApiKey(providerToSave)
-                                            } else {
-                                                apiKeyStore.saveApiKey(providerToSave, keyToSave)
-                                            }
-                                        }
-                                        apiKey = keyToSave
-                                        isEditingKey = false
-                                        message = if (keyToSave.isBlank()) {
-                                            "API key removed."
-                                        } else {
-                                            "API key saved securely."
-                                        }
-                                        settingsViewModel.discoverModels(providerToSave, keyToSave)
-                                    } catch (error: CancellationException) {
-                                        throw error
-                                    } catch (error: Exception) {
-                                        message = "Could not save API key: " +
-                                            (error.localizedMessage ?: "secure storage error")
-                                    } finally {
-                                        isSavingApiSettings = false
-                                    }
-                                }
-                            }
-                        },
-                    ) {
-                        Text(if (isEditingKey) "Save Key" else "Edit")
-                    }
-                }
-                OutlinedTextField(
-                    value = if (!isEditingKey && apiKey.isNotEmpty()) {
-                        "••••••••••••••••"
-                    } else {
-                        apiKey
-                    },
-                    onValueChange = { newValue ->
-                        if (isEditingKey) {
-                            apiKey = newValue
-                            message = null
-                        }
-                    },
-                    enabled = isEditingKey,
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("API key") },
-                    placeholder = { Text(aiProvider.keyHint) },
-                    singleLine = true,
-                    visualTransformation = if (isEditingKey) {
-                        PasswordVisualTransformation()
-                    } else {
-                        VisualTransformation.None
-                    },
-                    supportingText = {
-                        Text(
-                            if (isEditingKey) {
-                                "Save Key to apply changes. Saving an empty value removes this key."
-                            } else {
-                                "Key locked and encrypted on this device."
-                            },
-                        )
-                    },
-                )
-            }
-            ExposedDropdownMenuBox(
-                expanded = modelMenuExpanded,
-                onExpandedChange = { expanded ->
-                    modelMenuExpanded = expanded && !isDiscoveringModels && !isEditingKey
-                },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                OutlinedTextField(
-                    value = aiModel,
-                    onValueChange = { aiModel = it; message = null },
-                    enabled = !isDiscoveringModels && !isEditingKey,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .menuAnchor(
-                            type = ExposedDropdownMenuAnchorType.PrimaryEditable,
-                            enabled = !isDiscoveringModels && !isEditingKey,
-                        ),
-                    label = { Text("Model ID") },
-                    singleLine = true,
-                    trailingIcon = {
-                        if (isDiscoveringModels) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.padding(12.dp),
-                                strokeWidth = 2.dp,
-                            )
-                        } else {
-                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = modelMenuExpanded)
-                        }
-                    },
-                    placeholder = { Text(aiProvider.defaultModel) },
-                )
-                ExposedDropdownMenu(
-                    expanded = modelMenuExpanded,
-                    onDismissRequest = { modelMenuExpanded = false },
-                ) {
-                    val availableModels = discoveredModels.ifEmpty {
-                        listOf(
-                            DiscoveredModel(
-                                id = aiProvider.defaultModel,
-                                name = aiProvider.defaultModel,
-                            ),
-                        )
-                    }
-                    availableModels.forEach { model ->
-                        DropdownMenuItem(
-                            text = {
-                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text(
-                                        text = model.name,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                    if (model.id != model.name) {
-                                        Text(
-                                            text = model.id,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                    }
-                                    val freeTier = model.isFreeTier
-                                    Surface(
-                                        shape = RoundedCornerShape(50),
-                                        color = if (freeTier) {
-                                            MaterialTheme.colorScheme.tertiaryContainer
-                                        } else {
-                                            MaterialTheme.colorScheme.primaryContainer
-                                        },
-                                    ) {
-                                        Text(
-                                            text = when {
-                                                freeTier -> "[FREE]"
-                                                model.isHighPrecision -> "[PAID / PRO]"
-                                                else -> "[PAID]"
-                                            },
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = if (freeTier) {
-                                                MaterialTheme.colorScheme.onTertiaryContainer
-                                            } else {
-                                                MaterialTheme.colorScheme.onPrimaryContainer
-                                            },
-                                            modifier = Modifier.padding(
-                                                horizontal = 8.dp,
-                                                vertical = 3.dp,
-                                            ),
-                                        )
-                                    }
-                                }
-                            },
-                            onClick = {
-                                aiModel = model.id
-                                modelMenuExpanded = false
-                            },
-                        )
-                    }
-                }
-            }
-            modelDiscoveryMessage?.let { text ->
-                Text(
-                    text,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (discoveredModels.isEmpty()) {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                )
-            }
-            Text("BACKUP PROVIDERS", style = MaterialTheme.typography.labelLarge)
-            AiProvider.entries.filter { it != aiProvider }.forEach { provider ->
-                val configured = apiKeyStore.getApiKey(provider).isNullOrBlank().not()
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 2.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(provider.displayName, style = MaterialTheme.typography.bodyMedium)
-                        if (!configured) {
-                            Text(
-                                "Select provider above to add a key",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                    Switch(
-                        checked = fallbackEnabled[provider] ?: true,
-                        enabled = configured,
-                        onCheckedChange = { enabled ->
-                            fallbackEnabled = fallbackEnabled + (provider to enabled)
-                        },
-                    )
-                }
-            }
-            Button(
-                onClick = {
-                    if (isDiscoveringModels) return@Button
-                    val providerToDiscover = aiProvider
-                    val keyToDiscover = apiKey.trim()
-                    val modelToSave = aiModel.trim().ifBlank { providerToDiscover.defaultModel }
-                    val fallbackSettings = fallbackEnabled
-                    isSavingApiSettings = true
-                    coroutineScope.launch {
-                        try {
-                            withContext(Dispatchers.IO) {
-                                apiKeyStore.saveProviderConfig(
-                                    ProviderKeyConfig(
-                                        providerToDiscover,
-                                        keyToDiscover,
-                                        isEnabled = true,
-                                    ),
-                                )
-                                apiKeyStore.setSelectedAiProvider(providerToDiscover)
-                                apiKeyStore.saveAiModel(providerToDiscover, modelToSave)
-                                fallbackSettings.forEach { (provider, enabled) ->
-                                    apiKeyStore.setProviderEnabled(provider, enabled)
-                                }
-                            }
-                            message = "Provider and fallback settings saved."
-                            settingsViewModel.discoverModels(
-                                providerToDiscover,
-                                keyToDiscover,
-                            )
-                        } catch (error: CancellationException) {
-                            throw error
-                        } catch (error: Exception) {
-                            message = "Could not save AI settings: " +
-                                (error.localizedMessage ?: "storage error")
-                        } finally {
-                            isSavingApiSettings = false
-                        }
-                    }
-                },
-                enabled = !isDiscoveringModels,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(if (isDiscoveringModels) "Discovering models…" else "Save AI settings")
-            }
-            message?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
         }
+
+        ApiKeySettingsCard(settingsViewModel = viewModel)
     }
 
     if (showImportOptions) {
         AlertDialog(
             onDismissRequest = { showImportOptions = false },
-            title = { Text("Import books") },
-            text = { Text("Choose books to import, or select a folder to scan.") },
+            shape = RoundedCornerShape(24.dp),
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+            title = {
+                Text(
+                    text = "Import books",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            },
+            text = {
+                Text(
+                    text = "Choose books to import, or select a folder to scan.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
             confirmButton = {
                 TextButton(
                     onClick = {
                         showImportOptions = false
-                        documentPicker.launch(arrayOf("application/pdf", "application/epub+zip"))
+                        runCatching {
+                            documentPicker.launch(
+                                arrayOf("application/pdf", "application/epub+zip"),
+                            )
+                        }
                     },
                 ) {
                     Text("Choose files")
@@ -603,7 +507,7 @@ fun SettingsScreen(
                     TextButton(
                         onClick = {
                             showImportOptions = false
-                            folderPicker.launch(null)
+                            runCatching { folderPicker.launch(null) }
                         },
                     ) {
                         Text("Choose folder")
@@ -618,29 +522,89 @@ fun SettingsScreen(
 }
 
 @Composable
-private fun SettingsCard(
+private fun SettingsPrimaryButton(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+) {
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier,
+        shape = RoundedCornerShape(14.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = MaterialTheme.colorScheme.onSurface,
+            contentColor = MaterialTheme.colorScheme.surface,
+            disabledContainerColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
+            disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+        ),
+        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun DictionaryAppIcon(
+    app: AppInfo,
+    modifier: Modifier = Modifier,
+) {
+    val imageBitmap = remember(app.packageName) {
+        runCatching {
+            val size = 48
+            val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            app.icon.setBounds(0, 0, size, size)
+            app.icon.draw(canvas)
+            bitmap.asImageBitmap()
+        }.getOrNull()
+    }
+    imageBitmap?.let { bitmap ->
+        Icon(
+            painter = BitmapPainter(bitmap),
+            contentDescription = app.appName,
+            modifier = modifier,
+            tint = androidx.compose.ui.graphics.Color.Unspecified,
+        )
+    }
+}
+
+@Composable
+internal fun SettingsCard(
     title: String,
-    shape: Shape = RoundedCornerShape(16.dp),
+    modifier: Modifier = Modifier,
+    shape: Shape = RoundedCornerShape(20.dp),
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         shape = shape,
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp,
-            MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
+        color = MaterialTheme.colorScheme.surfaceContainerLow.copy(alpha = 0.92f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        border = BorderStroke(
+            width = 1.dp,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
         ),
+        shadowElevation = 1.dp,
     ) {
         Column(
-            modifier = Modifier.padding(18.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier
+                .padding(18.dp)
+                .animateContentSize(),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             Text(
-                title,
+                text = title,
                 style = MaterialTheme.typography.titleSmall,
-                letterSpacing = 1.5.sp,
+                letterSpacing = 1.sp,
+                fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface,
             )
             content()

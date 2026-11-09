@@ -70,6 +70,7 @@ import com.example.vibereader.core.database.VibeReaderDatabase
 import com.example.vibereader.data.room.BookEntity
 import com.example.vibereader.data.room.ReadingProgressEntity
 import com.example.vibereader.util.FileSharer
+import com.example.vibereader.util.displayTitle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -275,6 +276,7 @@ private fun BookGrid(
     ) {
         gridItems(books, key = { it.id }) { book ->
             val readingProgress = progressByBook[book.id]?.progress?.coerceIn(0f, 1f) ?: 0f
+            val displayTitle = book.displayTitle()
             val interactionSource = remember { MutableInteractionSource() }
             val pressed by interactionSource.collectIsPressedAsState()
             val scale by animateFloatAsState(
@@ -312,7 +314,7 @@ private fun BookGrid(
                             .background(MaterialTheme.colorScheme.surface),
                     ) {
                         BookCover(
-                            title = book.title,
+                            title = displayTitle,
                             coverImagePath = book.coverImagePath,
                             modifier = Modifier.fillMaxSize(),
                         )
@@ -331,7 +333,7 @@ private fun BookGrid(
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
                         Text(
-                            text = book.title,
+                            text = displayTitle,
                             style = MaterialTheme.typography.titleSmall,
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
@@ -373,6 +375,7 @@ private fun BookList(
     ) {
         columnItems(books, key = { it.id }) { book ->
             val progress = progressByBook[book.id]?.progress?.coerceIn(0f, 1f) ?: 0f
+            val displayTitle = book.displayTitle()
             val interactionSource = remember { MutableInteractionSource() }
             val pressed by interactionSource.collectIsPressedAsState()
             val scale by animateFloatAsState(
@@ -415,7 +418,7 @@ private fun BookList(
                         contentAlignment = Alignment.Center,
                     ) {
                         BookCover(
-                            title = book.title,
+                            title = displayTitle,
                             coverImagePath = book.coverImagePath,
                             modifier = Modifier.fillMaxSize(),
                         )
@@ -425,7 +428,7 @@ private fun BookList(
                         verticalArrangement = Arrangement.spacedBy(3.dp),
                     ) {
                         Text(
-                            book.title,
+                            displayTitle,
                             style = MaterialTheme.typography.titleSmall,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
@@ -461,7 +464,7 @@ private fun BookShareMenu(
         IconButton(
             onClick = { expanded = true },
             modifier = Modifier.semantics {
-                contentDescription = "Actions for ${book.title}"
+                contentDescription = "Actions for ${book.displayTitle()}"
             },
         ) {
             Text(

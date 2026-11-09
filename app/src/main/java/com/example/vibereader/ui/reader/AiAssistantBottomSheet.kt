@@ -1,23 +1,28 @@
 package com.example.vibereader.ui.reader
 
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -25,9 +30,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.example.vibereader.model.ReaderTtsVoice
+import com.example.vibereader.ui.reader.AiTaskResult
 import com.example.vibereader.util.FreeAiTtsPlayer
 import com.example.vibereader.util.TtsManager
 
@@ -54,15 +61,13 @@ fun AiAssistantBottomSheet(
     isWorking: Boolean,
     onSummarizeSelection: () -> Unit,
     onExplainSelection: () -> Unit,
-    targetLanguage: String,
-    onTargetLanguageChange: (String) -> Unit,
-    onTranslateSelection: (String) -> Unit,
-    onTranslatePage: (String) -> Unit,
-    onTranslateChapter: (String) -> Unit,
     onExtractQuote: () -> Unit,
     onSummarizePage: () -> Unit,
     onSummarizeChapter: () -> Unit,
     onSpeakPage: () -> Unit,
+    onAskBookAi: (String) -> Unit,
+    aiResult: AiTaskResult?,
+    onDismissAiResult: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val isSpeaking by ttsManager.isSpeaking
@@ -118,11 +123,14 @@ fun AiAssistantBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
     ) {
-        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        Box(modifier = Modifier.fillMaxWidth()) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = maxHeight * 0.58f)
+                    // A concrete cap guarantees finite constraints even if a
+                    // future sheet implementation measures with an unbounded
+                    // height; verticalScroll throws in that case.
+                    .heightIn(max = 520.dp)
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 24.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -193,44 +201,101 @@ fun AiAssistantBottomSheet(
             }
 
             Text("AI actions", style = MaterialTheme.typography.labelLarge)
+            Button(
+                onClick = {
+                    when (activeScope) {
+                        AssistantScope.SELECTION -> onSummarizeSelection()
+                        AssistantScope.CURRENT_PAGE -> onSummarizePage()
+                        AssistantScope.CURRENT_CHAPTER -> onSummarizeChapter()
+                        null -> Unit
+                    }
+                },
+                enabled = !isWorking && activeScope != null,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(if (isWorking) "Working…" else "Summarize")
+            }
+            var askQuestion by remember { mutableStateOf("") }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                OutlinedTextField(
+                    value = askQuestion,
+                    onValueChange = { askQuestion = it },
+                    label = { Text("Ask this book…") },
+                    modifier = Modifier.weight(1f),
+                    enabled = !isWorking,
+                )
                 Button(
                     onClick = {
-                        when (activeScope) {
-                            AssistantScope.SELECTION -> onSummarizeSelection()
-                            AssistantScope.CURRENT_PAGE -> onSummarizePage()
-                            AssistantScope.CURRENT_CHAPTER -> onSummarizeChapter()
-                            null -> Unit
+                        if (askQuestion.isNotBlank()) {
+                            onAskBookAi(askQuestion.trim())
+                            askQuestion = ""
                         }
                     },
-                    enabled = !isWorking && activeScope != null,
-                    modifier = Modifier.weight(1f),
+                    enabled = !isWorking && askQuestion.isNotBlank(),
                 ) {
-                    Text(if (isWorking) "Working…" else "Summarize")
-                }
-                TextButton(
-                    onClick = {
-                        when (activeScope) {
-                            AssistantScope.SELECTION -> onTranslateSelection(targetLanguage)
-                            AssistantScope.CURRENT_PAGE -> onTranslatePage(targetLanguage)
-                            AssistantScope.CURRENT_CHAPTER -> onTranslateChapter(targetLanguage)
-                            null -> Unit
-                        }
-                    },
-                    enabled = !isWorking && activeScope != null && targetLanguage.isNotBlank(),
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Text("Translate")
+                    Text("Ask")
                 }
             }
-            FastLanguageSelector(
-                selectedLanguage = targetLanguage,
-                onLanguageSelected = onTargetLanguageChange,
-                modifier = Modifier.fillMaxWidth(),
-            )
+            aiResult?.let { result ->
+                // The sheet body is already vertically scrollable. Nesting a
+                // second Modifier.verticalScroll here (or below on the Text)
+                // makes Compose measure it with infinite max height and throw
+                // "Vertically scrollable component was measured with an
+                // infinity maximum height constraints" as soon as a result
+                // appears — the crash reported after pressing Summarize/Ask.
+                val containerColor = if (result.isError) {
+                    MaterialTheme.colorScheme.errorContainer
+                } else {
+                    MaterialTheme.colorScheme.secondaryContainer
+                }
+                val contentColor = if (result.isError) {
+                    MaterialTheme.colorScheme.onErrorContainer
+                } else {
+                    MaterialTheme.colorScheme.onSecondaryContainer
+                }
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    color = containerColor,
+                    contentColor = contentColor,
+                    border = BorderStroke(
+                        width = 1.dp,
+                        color = if (result.isError) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.outlineVariant
+                        },
+                    ),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = result.title,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = contentColor,
+                        )
+                        Text(
+                            text = result.content,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = contentColor,
+                        )
+                        TextButton(
+                            onClick = onDismissAiResult,
+                            modifier = Modifier.align(Alignment.End),
+                            colors = ButtonDefaults.textButtonColors(
+                                contentColor = contentColor,
+                            ),
+                        ) {
+                            Text("Dismiss")
+                        }
+                    }
+                }
+            }
             if (activeScope == AssistantScope.SELECTION) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),

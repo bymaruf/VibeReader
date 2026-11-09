@@ -20,6 +20,22 @@ interface HighlightDao {
     @Query("SELECT * FROM highlights WHERE bookId = :bookId ORDER BY createdAt DESC")
     fun observeForBook(bookId: String): Flow<List<HighlightEntity>>
 
+    /**
+     * Universal lookup used by both PDF pages and EPUB chapters.
+     *
+     * `chapterIndex` is the PDF page index or the EPUB spine index, so the
+     * reader does not need to branch on the file format.
+     */
+    @Query(
+        "SELECT * FROM highlights WHERE bookId = :bookId AND chapterIndex = :chapterIndex " +
+            "ORDER BY characterOffset ASC, createdAt ASC",
+    )
+    fun getHighlightsForChapter(
+        bookId: String,
+        chapterIndex: Int,
+    ): Flow<List<HighlightEntity>>
+
+    /** Legacy PDF-specific query kept for compatibility with older call sites. */
     @Query(
         "SELECT * FROM highlights WHERE bookId = :bookId AND pageIndex = :pageIndex " +
             "ORDER BY createdAt ASC",
@@ -31,4 +47,7 @@ interface HighlightDao {
 
     @Delete
     suspend fun delete(highlight: HighlightEntity)
+
+    @Query("DELETE FROM highlights WHERE id = :highlightId")
+    suspend fun deleteById(highlightId: Long)
 }

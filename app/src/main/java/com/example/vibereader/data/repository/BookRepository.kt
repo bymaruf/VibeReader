@@ -6,7 +6,12 @@ import androidx.room.withTransaction
 import com.example.vibereader.core.database.VibeReaderDatabase
 import com.example.vibereader.data.room.BookDao
 import com.example.vibereader.data.room.BookEntity
+import com.example.vibereader.domain.model.EBookFormat
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.UUID
 
@@ -64,8 +69,13 @@ class BookRepository(
             try {
                 val existingBook = existingByUri[scanned.uri.toString()]
                 val existingFile = existingBook?.filePath?.takeIf(String::isNotBlank)?.let(::File)
+                // PDFs are indexed from metadata only (the reader renders pages on
+                // demand), so they do not need stored chapters to be considered cached.
                 val isCached = existingBook != null &&
-                    existingBook.id in bookIdsWithChapters &&
+                    (
+                        EBookFormat.fromLabel(scanned.format) == EBookFormat.PDF ||
+                            existingBook.id in bookIdsWithChapters
+                    ) &&
                     existingBook.sourceModifiedAt == scanned.modifiedAt &&
                     existingFile?.isFile == true &&
                     (scanned.sizeBytes <= 0 || existingFile.length() == scanned.sizeBytes)
@@ -134,7 +144,59 @@ class BookRepository(
         parserRepository.processScannedBook(indexedBook.book, indexedBook.sourceUri)
     }
 
+    /**
+     * Processes every pending book on a background thread.
+     *
+     * Each file is isolated: a timeout or an exception only skips that file, and
+     * [onProgress] is always invoked from the main thread so the UI can leave its
+     * "preparing details" state even when the queue contains a broken document.
+     */
+    suspend fun processIndexedBooks(
+        indexedBooks: List<IndexedBook>,
+        onProgress: (processed: Int, total: Int) -> Unit,
+    ): List<String> = withContext(Dispatchers.IO) {
+        val warnings = mutableListOf<String>()
+        indexedBooks.forEachIndexed { index, indexedBook ->
+            val timeoutMs = if (
+                EBookFormat.fromLabel(indexedBook.book.format) == EBookFormat.PDF
+            ) {
+                PDF_PROCESS_TIMEOUT_MS
+            } else {
+                EPUB_PROCESS_TIMEOUT_MS
+            }
+            try {
+                val completed = withTimeoutOrNull(timeoutMs) {
+                    processIndexedBook(indexedBook)
+                }
+                if (completed == null) {
+                    val message = "Timed out while preparing ${indexedBook.book.title}."
+                    Log.w(TAG, "$message The document may be corrupted or too large.")
+                    warnings += message
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.e(
+                    "LibraryIndex",
+                    "Failed to parse ${indexedBook.book.title}: ${error.message}",
+                    error,
+                )
+                warnings += "Couldn't prepare ${indexedBook.book.title}: " +
+                    (error.localizedMessage ?: "metadata extraction failed")
+            } finally {
+                // Progress is reported even when the file fails or times out so the
+                // indexing state can never get stuck on a single document.
+                withContext(NonCancellable + Dispatchers.Main.immediate) {
+                    onProgress(index + 1, indexedBooks.size)
+                }
+            }
+        }
+        warnings
+    }
+
     private companion object {
         const val TAG = "VibeReaderScan"
+        const val PDF_PROCESS_TIMEOUT_MS = 2_000L
+        const val EPUB_PROCESS_TIMEOUT_MS = 60_000L
     }
 }

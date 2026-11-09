@@ -8,6 +8,7 @@ import com.example.vibereader.data.remote.EdgeTtsClient
 import com.example.vibereader.model.ReaderTtsVoice
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,7 +27,12 @@ class FreeAiTtsPlayer(
     private val edgeTtsClient: EdgeTtsClient = EdgeTtsClient(),
 ) {
     private val appContext = context.applicationContext
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val errorHandler = CoroutineExceptionHandler { _, error ->
+        Log.e(TAG, "Unhandled speech coroutine failure", error)
+    }
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Main.immediate + errorHandler,
+    )
     private var mediaPlayer: MediaPlayer? = null
     private var cachedAudioFile: File? = null
     private var synthesisJob: kotlinx.coroutines.Job? = null
@@ -120,7 +126,7 @@ class FreeAiTtsPlayer(
                 player.prepareAsync()
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (exception: Exception) {
+            } catch (anyFailure: Throwable) {
                 if (generation != playbackGeneration) return@launch
                 isLoading.value = false
                 isPlaying.value = false
@@ -129,7 +135,7 @@ class FreeAiTtsPlayer(
                 mediaPlayer = null
                 cachedAudioFile?.delete()
                 cachedAudioFile = null
-                fallbackToNative(cleanText, onNativeFallback, exception, generation)
+                fallbackToNative(cleanText, onNativeFallback, anyFailure.toSpeechFailure(), generation)
             }
         }
     }
@@ -182,7 +188,7 @@ class FreeAiTtsPlayer(
     private fun fallbackToNative(
         text: String,
         onNativeFallback: ((String) -> Unit)?,
-        cause: Exception,
+        cause: Throwable,
         generation: Long,
     ) {
         if (generation != playbackGeneration) return
@@ -204,7 +210,7 @@ class FreeAiTtsPlayer(
         error.value = null
         try {
             onNativeFallback(text)
-        } catch (fallbackError: Exception) {
+        } catch (fallbackError: Throwable) {
             Log.e(TAG, "Native Android TTS fallback could not start.", fallbackError)
             isUsingNativeFallback.value = false
             error.value = fallbackError.localizedMessage
@@ -212,28 +218,48 @@ class FreeAiTtsPlayer(
         }
     }
 
+    /** Normalizes any failure into an IOException the UI layers already handle. */
+    private fun Throwable.toSpeechFailure(): IOException = when (this) {
+        is IOException -> this
+        is OutOfMemoryError -> IOException("Not enough memory to generate speech audio.", this)
+        else -> IOException(
+            localizedMessage?.takeIf(String::isNotBlank)
+                ?: "Edge TTS is currently unavailable.",
+            this,
+        )
+    }
+
     private fun startProgressUpdates(player: MediaPlayer) {
         progressJob?.cancel()
         progressJob = scope.launch {
-            while (player === mediaPlayer && player.isPlaying && speechText.isNotEmpty()) {
-                val duration = player.duration
-                if (duration > 0) {
-                    val characterIndex = (
-                        speechText.length.toLong() * player.currentPosition / duration
-                    ).toInt().coerceIn(0, speechText.lastIndex)
-                    var start = characterIndex
-                    while (start > 0 && !speechText[start - 1].isWhitespace()) start--
-                    var end = characterIndex
-                    while (end < speechText.length && !speechText[end].isWhitespace()) end++
-                    _speechProgress.value = SpeechProgress(
-                        startCharIndex = start,
-                        endCharIndex = end.coerceAtLeast(start + 1),
-                        utteranceId = EDGE_UTTERANCE_ID,
-                        isActive = true,
-                        isApproximate = true,
-                    )
+            try {
+                while (player === mediaPlayer && player.isPlaying && speechText.isNotEmpty()) {
+                    val duration = player.duration
+                    if (duration > 0) {
+                        val characterIndex = (
+                            speechText.length.toLong() * player.currentPosition / duration
+                        ).toInt().coerceIn(0, speechText.lastIndex)
+                        var start = characterIndex
+                        while (start > 0 && !speechText[start - 1].isWhitespace()) start--
+                        var end = characterIndex
+                        while (end < speechText.length && !speechText[end].isWhitespace()) end++
+                        _speechProgress.value = SpeechProgress(
+                            startCharIndex = start,
+                            endCharIndex = end.coerceAtLeast(start + 1),
+                            utteranceId = EDGE_UTTERANCE_ID,
+                            isActive = true,
+                            isApproximate = true,
+                        )
+                    }
+                    delay(PROGRESS_INTERVAL_MS)
                 }
-                delay(PROGRESS_INTERVAL_MS)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: IllegalStateException) {
+                // The MediaPlayer was released mid-tick (stop / new playback) —
+                // treat as a normal stop instead of crashing the process.
+            } catch (failure: Throwable) {
+                Log.w(TAG, "Speech progress tracking stopped unexpectedly", failure)
             }
         }
     }

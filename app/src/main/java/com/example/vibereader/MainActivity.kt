@@ -1,7 +1,7 @@
 package com.example.vibereader
 
-import android.app.Activity
 import android.Manifest
+import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -11,11 +11,13 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.core.content.ContextCompat
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -25,18 +27,15 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Modifier
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
-import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.runtime.SideEffect
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -45,14 +44,13 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import com.example.vibereader.ui.library.LibraryScreen
+import com.example.vibereader.core.database.VibeReaderDatabase
+import com.example.vibereader.core.theme.ThemeOption
+import com.example.vibereader.core.theme.VibeReaderTheme
 import com.example.vibereader.ui.library.LibraryScreen
 import com.example.vibereader.ui.quotes.QuotesScreen
 import com.example.vibereader.ui.reader.ReaderScreen
 import com.example.vibereader.ui.settings.SettingsScreen
-import com.example.vibereader.core.theme.VibeReaderTheme
-import com.example.vibereader.core.theme.ThemeOption
-import com.example.vibereader.core.database.VibeReaderDatabase
 import com.example.vibereader.ui.settings.SettingsViewModel
 
 class MainActivity : ComponentActivity() {
@@ -107,12 +105,18 @@ private fun VibeReaderRoot() {
         }
     }
     val database = remember(context) { VibeReaderDatabase.getInstance(context) }
+
+    // One activity-scoped SettingsViewModel is shared by the root theme wrapper
+    // and the Settings tab. This is what makes an appearance change recompose
+    // the whole app immediately instead of only updating the Settings screen.
     val settingsViewModel: SettingsViewModel = viewModel(
         factory = remember(context, database) {
             SettingsViewModel.Factory(database, context.applicationContext)
         },
     )
-    val currentTheme by settingsViewModel.appTheme.collectAsStateWithLifecycle()
+    val currentTheme by settingsViewModel.appTheme.collectAsStateWithLifecycle(
+        initialValue = ThemeOption.SYSTEM,
+    )
     val systemDarkTheme = isSystemInDarkTheme()
 
     VibeReaderTheme(themeOption = currentTheme) {
@@ -130,14 +134,15 @@ private fun VibeReaderRoot() {
         }
         Surface(
             modifier = Modifier.fillMaxSize(),
-            color = when (currentTheme) {
-                ThemeOption.OLED_BLACK -> Color.Black
-                ThemeOption.SEPIA -> Color(0xFFF8F1E5)
-                ThemeOption.LIGHT -> Color.White
-                ThemeOption.SYSTEM -> MaterialTheme.colorScheme.background
-            },
+            // Follow the active color scheme directly. Hardcoded theme colors
+            // here used to mask the real theme during a switch.
+            color = MaterialTheme.colorScheme.background,
+            contentColor = MaterialTheme.colorScheme.onBackground,
         ) {
-            VibeReaderApp(settingsViewModel, currentTheme, storageAccessReady)
+            VibeReaderApp(
+                settingsViewModel = settingsViewModel,
+                storageAccessReady = storageAccessReady,
+            )
         }
     }
 }
@@ -158,7 +163,6 @@ private val destinations = listOf(
 @Composable
 private fun VibeReaderApp(
     settingsViewModel: SettingsViewModel,
-    appTheme: ThemeOption,
     storageAccessReady: Boolean,
 ) {
     val navController = rememberNavController()
@@ -167,6 +171,7 @@ private fun VibeReaderApp(
     val isReader = currentDestination?.route?.startsWith("reader/") == true
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         bottomBar = {
             if (!isReader) {
                 NavigationBar(
@@ -180,9 +185,11 @@ private fun VibeReaderApp(
                         NavigationBarItem(
                             selected = selected,
                             onClick = {
-                                navController.navigate(destination.route) {
-                                    launchSingleTop = true
-                                    restoreState = true
+                                runCatching {
+                                    navController.navigate(destination.route) {
+                                        launchSingleTop = true
+                                        restoreState = true
+                                    }
                                 }
                             },
                             icon = { Text(destination.marker) },
@@ -202,18 +209,21 @@ private fun VibeReaderApp(
                 LibraryScreen(
                     scanEnabled = storageAccessReady,
                     onBookSelected = { bookId ->
-                        navController.navigate("reader/$bookId")
+                        runCatching { navController.navigate("reader/$bookId") }
                     },
                 )
             }
             composable("quotes") { QuotesScreen() }
-            composable("settings") { SettingsScreen(settingsViewModel = settingsViewModel) }
+            composable("settings") {
+                // Reuse the activity-scoped instance so setTheme() updates the
+                // same StateFlow that MainActivity collects for VibeReaderTheme.
+                SettingsScreen(viewModel = settingsViewModel)
+            }
             composable("reader/{bookId}") { entry ->
                 val bookId = entry.arguments?.getString("bookId").orEmpty()
                 ReaderScreen(
                     bookId = bookId,
-                    onBack = { navController.popBackStack() },
-                    appTheme = appTheme,
+                    onBack = { runCatching { navController.popBackStack() } },
                 )
             }
         }

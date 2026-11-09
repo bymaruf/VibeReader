@@ -12,7 +12,6 @@ import com.example.vibereader.data.repository.DeviceBookScanner
 import com.example.vibereader.data.room.BookEntity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.yield
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -91,57 +90,68 @@ class LibraryViewModel(
             try {
                 val treeUri = preferences.getString(TREE_URI_KEY, null)?.let(Uri::parse)
                 val summary = repository.scanDevice(treeUri)
+                val pendingBooks = summary.pendingProcessing
                 _scanState.value = _scanState.value.copy(
                     isScanning = false,
-                    isProcessingMetadata = summary.pendingProcessing.isNotEmpty(),
-                    statusMessage = if (summary.pendingProcessing.isNotEmpty()) {
-                        "Indexed ${summary.added} new books. Preparing details for ${summary.pendingProcessing.size} books…"
+                    isProcessingMetadata = pendingBooks.isNotEmpty(),
+                    statusMessage = if (pendingBooks.isNotEmpty()) {
+                        "Indexed ${summary.added} new books. Preparing details for ${pendingBooks.size} books…"
                     } else {
                         scanCompleteMessage(summary.added, summary.removed)
                     },
                     errorMessage = summary.warnings.takeIf { it.isNotEmpty() }
                         ?.joinToString(separator = "\n"),
                 )
-                if (summary.pendingProcessing.isNotEmpty()) {
-                    viewModelScope.launch(Dispatchers.Default) {
-                        val processingWarnings = mutableListOf<String>()
-                        try {
-                            summary.pendingProcessing.forEach { indexedBook ->
-                                yield()
-                                try {
-                                    repository.processIndexedBook(indexedBook)
-                                } catch (error: CancellationException) {
-                                    throw error
-                                } catch (error: Exception) {
-                                    processingWarnings += "Couldn't prepare ${indexedBook.book.title}: " +
-                                        (error.localizedMessage ?: "metadata extraction failed")
-                                }
-                            }
-                        } finally {
-                            _scanState.value = _scanState.value.copy(
-                                isProcessingMetadata = false,
-                                statusMessage = scanCompleteMessage(summary.added, summary.removed),
-                                errorMessage = listOfNotNull(
-                                    summary.warnings.takeIf { it.isNotEmpty() }
-                                        ?.joinToString(separator = "\n"),
-                                    processingWarnings.takeIf { it.isNotEmpty() }
-                                        ?.joinToString(separator = "\n"),
-                                ).joinToString(separator = "\n").takeIf { it.isNotBlank() },
-                            )
-                        }
+
+                if (pendingBooks.isNotEmpty()) {
+                    val processingWarnings = repository.processIndexedBooks(pendingBooks) { processed, total ->
+                        _scanState.value = _scanState.value.copy(
+                            isProcessingMetadata = processed < total,
+                            statusMessage = if (processed < total) {
+                                "Preparing details for ${pendingBooks.size} books… ($processed/$total)"
+                            } else {
+                                "Preparing details for ${pendingBooks.size} books…"
+                            },
+                        )
                     }
+                    _scanState.value = _scanState.value.copy(
+                        isProcessingMetadata = false,
+                        statusMessage = scanCompleteMessage(summary.added, summary.removed),
+                        errorMessage = combineMessages(
+                            summary.warnings.takeIf { it.isNotEmpty() }
+                                ?.joinToString(separator = "\n"),
+                            processingWarnings.takeIf { it.isNotEmpty() }
+                                ?.joinToString(separator = "\n"),
+                        ),
+                    )
                 }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
                 _scanState.value = _scanState.value.copy(
                     isScanning = false,
+                    isProcessingMetadata = false,
                     statusMessage = null,
                     errorMessage = error.localizedMessage ?: "The device scan failed.",
                 )
+            } finally {
+                // Guarantee the library never stays stuck in a loading state.
+                if (_scanState.value.isScanning || _scanState.value.isProcessingMetadata) {
+                    _scanState.value = _scanState.value.copy(
+                        isScanning = false,
+                        isProcessingMetadata = false,
+                        statusMessage = null,
+                    )
+                }
             }
         }
     }
+
+    private fun combineMessages(vararg messages: String?): String? =
+        messages
+            .filterNot { it.isNullOrBlank() }
+            .joinToString(separator = "\n")
+            .takeIf { it.isNotBlank() }
 
     private fun scanCompleteMessage(added: Int, removed: Int): String = when {
         added > 0 || removed > 0 -> "Scan complete: $added added, $removed removed."

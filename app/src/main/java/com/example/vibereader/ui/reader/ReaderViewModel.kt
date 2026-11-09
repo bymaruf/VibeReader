@@ -4,12 +4,22 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
 import android.graphics.pdf.PdfRenderer
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.util.Log
+import android.widget.Toast
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.vibereader.core.database.VibeReaderDatabase
-import com.example.vibereader.core.secure_storage.ApiKeyStore
+import com.example.vibereader.data.document.EBookDocumentLoader
+import com.example.vibereader.data.remote.AiProviderHttpException
+import com.example.vibereader.data.repository.AiConfigurationException
+import com.example.vibereader.data.repository.AiFailoverManager
+import com.example.vibereader.data.repository.AiRequestException
+import com.example.vibereader.data.repository.AiRuntimeResolver
+import com.example.vibereader.data.repository.AskAiEngine
 import com.example.vibereader.data.repository.BookParserRepository
 import com.example.vibereader.data.repository.BookRepository
 import com.example.vibereader.data.repository.DeviceBookScanner
@@ -18,10 +28,10 @@ import com.example.vibereader.data.room.BookEntity
 import com.example.vibereader.data.room.BookReadingThemeEntity
 import com.example.vibereader.data.room.HighlightEntity
 import com.example.vibereader.data.room.QuoteEntity
+import com.example.vibereader.data.room.QuoteSource
 import com.example.vibereader.data.room.ReadingProgressEntity
 import com.example.vibereader.data.room.ReaderPreferenceEntity
-import com.example.vibereader.model.AiProvider
-import com.example.vibereader.model.ProviderKeyConfig
+import com.example.vibereader.domain.model.EBookFormat
 import com.example.vibereader.model.ReadingTheme
 import com.example.vibereader.util.PdfPageCache
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
@@ -30,23 +40,23 @@ import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.text.TextPosition
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
-import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
 import kotlin.math.roundToInt
 
@@ -72,25 +82,15 @@ data class ReaderSelection(
     val pdfHighlightRects: List<PdfSelectionRect> = emptyList(),
     val pdfStartHandle: PdfSelectionPoint? = null,
     val pdfEndHandle: PdfSelectionPoint? = null,
-)
-
-data class PdfSelectionPoint(val x: Float, val y: Float)
-
-data class PdfSelectionRect(
-    val left: Float,
-    val top: Float,
-    val right: Float,
-    val bottom: Float,
-)
-
-private data class PdfSpeechPage(
-    val text: String,
-    val charRects: List<PdfSelectionRect?>,
+    /** Set when this selection was created by tapping a saved highlight. */
+    val highlightId: Long? = null,
 )
 
 data class AiTaskResult(
     val title: String,
     val content: String,
+    /** True when the card represents a setup, network, or provider failure. */
+    val isError: Boolean = false,
 )
 
 data class ReaderUiState(
@@ -128,19 +128,26 @@ class ReaderViewModel(
         scanner = DeviceBookScanner(appContext),
         parserRepository = BookParserRepository(appContext, database),
     )
+    private val documentLoader = EBookDocumentLoader(appContext)
+    // Lazily created: EncryptedSharedPreferences/keystore setup must not run
+    // during ViewModel construction (a corrupted keystore would otherwise
+    // crash the reader before the user even presses an AI button).
+    private val askAiEngine by lazy { AskAiEngine(appContext) }
     private val stateLock = Any()
     private val renderingPages = mutableSetOf<String>()
     private val renderedPdfPages = mutableSetOf<String>()
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .callTimeout(120, TimeUnit.SECONDS)
-        .build()
     private val _uiState = MutableStateFlow(ReaderUiState())
     val uiState: StateFlow<ReaderUiState> = _uiState.asStateFlow()
 
     private var loadedBookId: String? = null
+
+    /**
+     * The EPUB chapter the reader is actually on right now. The selection may
+     * be empty and `initialEpubChapter` only reflects the last saved location,
+     * so Ask AI must use this live value to attach the correct chapter context.
+     */
+    @Volatile
+    private var currentEpubChapter: Int = 0
     private var pdfDescriptor: ParcelFileDescriptor? = null
     private var pdfRenderer: PdfRenderer? = null
     private var pdfRendererBookId: String? = null
@@ -148,7 +155,55 @@ class ReaderViewModel(
     private var pdfSelectionJob: Job? = null
     private var pdfHighlightsJob: Job? = null
     private var pdfPageTextJob: Job? = null
-    private val pdfSpeechPages = mutableMapOf<Int, PdfSpeechPage>()
+    private val pdfPageLayouts = mutableMapOf<Int, PdfPageLayout>()
+    private val pdfLayoutLock = Any()
+    private val pdfLayoutGateLock = Any()
+    private val pdfLayoutGates = mutableMapOf<Int, Any>()
+
+    /**
+     * Global safety net for every coroutine in the reader. Any failure that
+     * escapes a local try-catch (network errors, HTTP 4xx/5xx, JSON parsing,
+     * SQLite faults, out-of-memory during PDF processing, race fallout) is
+     * logged and surfaced as a non-blocking Snackbar message instead of
+     * terminating the whole process.
+     */
+    private val uncaughtExceptionHandler = CoroutineExceptionHandler { _, error ->
+        Log.e(TAG, "Unhandled coroutine failure", error)
+        showFailureMessage(error)
+    }
+
+    private fun guardedLaunch(
+        dispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
+        block: suspend CoroutineScope.() -> Unit,
+    ): Job = viewModelScope.launch(uncaughtExceptionHandler + dispatcher) {
+        try {
+            block()
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (error: Throwable) {
+            Log.e(TAG, "Handled coroutine failure", error)
+            showFailureMessage(error)
+        }
+    }
+
+    private fun showFailureMessage(error: Throwable) {
+        val message = when (error) {
+            is OutOfMemoryError ->
+                "Not enough memory to finish this action. Try a smaller page or zoom level."
+            is android.database.sqlite.SQLiteException ->
+                "Could not save to your library. Storage may be full or busy."
+            is AiProviderHttpException ->
+                error.localizedMessage?.takeIf(String::isNotBlank)
+                    ?: "AI service temporarily unavailable."
+            is IOException ->
+                error.localizedMessage?.takeIf(String::isNotBlank)
+                    ?: "A network or file error occurred. Please try again."
+            else ->
+                error.localizedMessage?.takeIf(String::isNotBlank)
+                    ?: "Something went wrong. Your book is safe. Please try again."
+        }
+        showMessage(message)
+    }
 
     fun loadBook(bookId: String) {
         if (loadedBookId == bookId) return
@@ -156,8 +211,8 @@ class ReaderViewModel(
         pdfSelectionJob?.cancel()
         pdfHighlightsJob?.cancel()
         pdfPageTextJob?.cancel()
-        pdfSpeechPages.clear()
-        viewModelScope.launch {
+        synchronized(pdfLayoutLock) { pdfPageLayouts.clear() }
+        guardedLaunch {
             _uiState.value = ReaderUiState(isLoading = true)
             closePdfRenderer()
             try {
@@ -208,6 +263,8 @@ class ReaderViewModel(
                     setPdfPageIndex(page)
                 } else {
                     val savedLocation = EPUB_LOCATION_REGEX.matchEntire(location)
+                    val savedChapter = savedLocation?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    currentEpubChapter = savedChapter.coerceAtLeast(0)
                     _uiState.value = ReaderUiState(
                         isLoading = false,
                         book = book,
@@ -216,7 +273,7 @@ class ReaderViewModel(
                             scrollMode = savedScrollMode,
                             readingTheme = savedReadingTheme,
                         ),
-                        initialEpubChapter = savedLocation?.groupValues?.get(1)?.toIntOrNull() ?: 0,
+                        initialEpubChapter = savedChapter,
                         initialEpubScrollOffset = savedLocation?.groupValues?.get(2)?.toIntOrNull() ?: 0,
                     )
                 }
@@ -237,7 +294,7 @@ class ReaderViewModel(
         _uiState.value = state.copy(settings = settings)
         val bookId = state.book?.id ?: return
         if (state.settings.readingTheme == settings.readingTheme) return
-        viewModelScope.launch {
+        guardedLaunch {
             try {
                 withContext(Dispatchers.IO) {
                     database.bookReadingThemeDao().upsert(
@@ -259,7 +316,7 @@ class ReaderViewModel(
         val state = _uiState.value
         if (state.settings.scrollMode == mode) return
         _uiState.value = state.copy(settings = state.settings.copy(scrollMode = mode))
-        viewModelScope.launch {
+        guardedLaunch {
             try {
                 withContext(Dispatchers.IO) {
                     database.readerPreferenceDao().upsert(
@@ -279,12 +336,12 @@ class ReaderViewModel(
     }
 
     fun updatePdfSpeechHighlight(pageIndex: Int, start: Int, end: Int) {
-        val page = pdfSpeechPages[pageIndex]
+        val page = synchronized(pdfLayoutLock) { pdfPageLayouts[pageIndex] }
         if (page == null || start !in page.text.indices || end <= start) {
             clearPdfSpeechHighlight()
             return
         }
-        val rects = mergeSpeechRects(
+        val rects = mergePdfSelectionRects(
             page.charRects.subList(start.coerceAtLeast(0), end.coerceAtMost(page.charRects.size))
                 .filterNotNull(),
         )
@@ -309,7 +366,17 @@ class ReaderViewModel(
     }
 
     fun selectPdfTextAt(pageIndex: Int, xFraction: Float, yFraction: Float) {
-        selectPdfTextRange(pageIndex, xFraction, yFraction, xFraction, yFraction)
+        selectPdfTextRangeInternal(
+            pageIndex = pageIndex,
+            startX = xFraction,
+            startY = yFraction,
+            endX = xFraction,
+            endY = yFraction,
+            highlightId = null,
+            movingHandle = null,
+            previousStart = null,
+            previousEnd = null,
+        )
     }
 
     fun movePdfSelectionHandle(
@@ -322,11 +389,17 @@ class ReaderViewModel(
             ?.takeIf { it.chapterIndex == pageIndex } ?: return
         val start = selection.pdfStartHandle ?: return
         val end = selection.pdfEndHandle ?: return
-        if (isStartHandle) {
-            selectPdfTextRange(pageIndex, xFraction, yFraction, end.x, end.y)
-        } else {
-            selectPdfTextRange(pageIndex, start.x, start.y, xFraction, yFraction)
-        }
+        selectPdfTextRangeInternal(
+            pageIndex = pageIndex,
+            startX = if (isStartHandle) xFraction else start.x,
+            startY = if (isStartHandle) yFraction else start.y,
+            endX = if (isStartHandle) end.x else xFraction,
+            endY = if (isStartHandle) end.y else yFraction,
+            highlightId = null,
+            movingHandle = isStartHandle,
+            previousStart = start,
+            previousEnd = end,
+        )
     }
 
     fun selectPdfTextRange(
@@ -336,6 +409,94 @@ class ReaderViewModel(
         endX: Float,
         endY: Float,
     ) {
+        selectPdfTextRangeInternal(
+            pageIndex = pageIndex,
+            startX = startX,
+            startY = startY,
+            endX = endX,
+            endY = endY,
+            highlightId = null,
+            movingHandle = null,
+            previousStart = null,
+            previousEnd = null,
+        )
+    }
+
+    /**
+     * Re-selects a saved highlight so the contextual menu can offer
+     * Unhighlight, Copy and Save Quote without any extra PDF parsing.
+     */
+    fun selectPdfHighlight(highlight: HighlightEntity) {
+        val state = _uiState.value
+        val book = state.book?.takeIf { it.format.equals("PDF", ignoreCase = true) } ?: return
+        if (highlight.bookId != book.id) return
+        pdfSelectionJob?.cancel()
+        pdfSelectionJob = null
+
+        val pageIndex = (highlight.pageIndex ?: highlight.chapterIndex)
+            .coerceIn(0, (state.pdfPageCount - 1).coerceAtLeast(0))
+        val rects = parsePdfHighlightRects(highlight.boundsJson)
+            .sortedWith(compareBy({ it.top }, { it.left }))
+        val storedStart = highlight.startCharOffset
+        val legacyStart = highlight.characterOffset
+        val startOffset = if (storedStart > 0 || legacyStart <= 0) storedStart else legacyStart
+        val storedEnd = highlight.endCharOffset
+        val legacyEnd = highlight.endCharacterOffset
+        val endOffset = when {
+            storedEnd > startOffset -> storedEnd
+            legacyEnd > startOffset -> legacyEnd
+            else -> startOffset + highlight.selectedText.length
+        }
+        val startHandle = rects.firstOrNull()?.let {
+            PdfSelectionPoint(x = it.left, y = it.centerY)
+        }
+        val endHandle = rects.lastOrNull()?.let {
+            PdfSelectionPoint(x = it.right, y = it.centerY)
+        }
+        setSelection(
+            ReaderSelection(
+                chapterIndex = pageIndex,
+                chapterTitle = highlight.note?.takeIf { it.isNotBlank() }
+                    ?: "Page ${pageIndex + 1}",
+                text = highlight.selectedText,
+                startOffset = startOffset,
+                endOffset = endOffset.coerceAtLeast(startOffset),
+                pdfHighlightRects = rects,
+                pdfStartHandle = startHandle,
+                pdfEndHandle = endHandle,
+                highlightId = highlight.id,
+            ),
+        )
+    }
+
+    fun unhighlightSelection() {
+        val highlightId = _uiState.value.selection?.highlightId ?: return
+        guardedLaunch {
+            try {
+                database.highlightDao().deleteById(highlightId)
+                if (_uiState.value.selection?.highlightId == highlightId) {
+                    clearSelection()
+                }
+                showMessage("Highlight removed.")
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                showMessage(error.localizedMessage ?: "Could not remove this highlight.")
+            }
+        }
+    }
+
+    private fun selectPdfTextRangeInternal(
+        pageIndex: Int,
+        startX: Float,
+        startY: Float,
+        endX: Float,
+        endY: Float,
+        highlightId: Long?,
+        movingHandle: Boolean?,
+        previousStart: PdfSelectionPoint?,
+        previousEnd: PdfSelectionPoint?,
+    ) {
         val state = _uiState.value
         val book = state.book?.takeIf { it.format.equals("PDF", ignoreCase = true) } ?: return
         if (
@@ -344,141 +505,30 @@ class ReaderViewModel(
         ) return
 
         pdfSelectionJob?.cancel()
-        pdfSelectionJob = viewModelScope.launch {
+        pdfSelectionJob = guardedLaunch {
             try {
                 val selection = withContext(Dispatchers.IO) {
-                    val file = File(book.filePath)
-                    if (!file.isFile) throw IOException("The local PDF file is missing.")
-                    PDFBoxResourceLoader.init(appContext)
-                    PDDocument.load(file, MemoryUsageSetting.setupTempFileOnly()).use { document ->
-                        if (pageIndex !in 0 until document.numberOfPages) {
-                            throw IOException("The requested PDF page is unavailable.")
-                        }
-                        val page = document.getPage(pageIndex)
-                        val mediaBox = page.mediaBox
-                            ?: throw IOException("The requested PDF page has invalid bounds.")
-                        val pageWidth = mediaBox.width
-                        val pageHeight = mediaBox.height
-                        if (
-                            !pageWidth.isFinite() || !pageHeight.isFinite() ||
-                            pageWidth <= 0f || pageHeight <= 0f
-                        ) {
-                            throw IOException("The requested PDF page has invalid bounds.")
-                        }
-                        val positions = mutableListOf<TextPosition>()
-                        val stripper = object : PDFTextStripper() {
-                            override fun writeString(
-                                text: String,
-                                textPositions: MutableList<TextPosition>,
-                            ) {
-                                super.writeString(text, textPositions)
-                                positions.addAll(textPositions)
-                            }
-                        }.apply {
-                            startPage = pageIndex + 1
-                            endPage = pageIndex + 1
-                        }
-                        stripper.getText(document)
-
-                        val validPositions = positions.mapIndexedNotNull { index, position ->
-                            val x = position.xDirAdj
-                            val y = position.yDirAdj
-                            val width = position.widthDirAdj
-                            val height = position.heightDir
-                            if (
-                                x.isFinite() && y.isFinite() &&
-                                width.isFinite() && height.isFinite() &&
-                                width > 0f && height > 0f &&
-                                position.unicode?.isNotEmpty() == true
-                            ) index else null
-                        }
-                        fun nearestIndexAt(xFraction: Float, yFraction: Float): Int? =
-                            validPositions.minByOrNull { index ->
-                                val position = positions[index]
-                                val centerX =
-                                    (position.xDirAdj + position.widthDirAdj / 2f) / pageWidth
-                                val centerY =
-                                    (position.yDirAdj - position.heightDir / 2f) / pageHeight
-                                val dx = centerX - xFraction
-                                val dy = centerY - yFraction
-                                dx * dx + dy * dy
-                            }
-                        val firstIndex = nearestIndexAt(startX, startY)
-                            ?: return@withContext null
-                        val lastIndex = nearestIndexAt(endX, endY)
-                            ?: return@withContext null
-                        val firstWord = wordRangeAt(positions, firstIndex)
-                            ?: return@withContext null
-                        val lastWord = wordRangeAt(positions, lastIndex)
-                            ?: return@withContext null
-                        val firstPositionIndex = minOf(firstWord.first, lastWord.first)
-                        val lastPositionIndex = maxOf(firstWord.last, lastWord.last)
-                        val selectedPositions = positions.subList(
-                            firstPositionIndex,
-                            lastPositionIndex + 1,
-                        )
-                        val selectedText = selectedPositions
-                            .joinToString(separator = "") { it.unicode.orEmpty() }
-                            .trim()
-                        if (selectedText.isEmpty()) {
-                            return@use null
-                        }
-                        val highlightRects = selectedPositions.mapNotNull { position ->
-                            if (
-                                !position.xDirAdj.isFinite() ||
-                                !position.yDirAdj.isFinite() ||
-                                !position.widthDirAdj.isFinite() ||
-                                !position.heightDir.isFinite() ||
-                                position.widthDirAdj <= 0f ||
-                                position.heightDir <= 0f
-                            ) {
-                                return@mapNotNull null
-                            }
-                            val left = (position.xDirAdj / pageWidth).coerceIn(0f, 1f)
-                            val top = ((position.yDirAdj - position.heightDir) / pageHeight)
-                                .coerceIn(0f, 1f)
-                            val right = ((position.xDirAdj + position.widthDirAdj) / pageWidth)
-                                .coerceIn(0f, 1f)
-                            val bottom = (position.yDirAdj / pageHeight).coerceIn(0f, 1f)
-                            if (
-                                left.isFinite() && top.isFinite() &&
-                                right.isFinite() && bottom.isFinite() &&
-                                right > left && bottom > top
-                            ) {
-                                PdfSelectionRect(left, top, right, bottom)
-                            } else {
-                                null
-                            }
-                        }
-                        if (highlightRects.isEmpty()) return@use null
-                        val firstPosition = positions[firstPositionIndex]
-                        val lastPosition = positions[lastPositionIndex]
-                        ReaderSelection(
-                            chapterIndex = pageIndex,
-                            chapterTitle = "Page ${pageIndex + 1}",
-                            text = selectedText,
-                            startOffset = firstPositionIndex,
-                            endOffset = lastPositionIndex + 1,
-                            pdfHighlightRects = highlightRects,
-                            pdfStartHandle = PdfSelectionPoint(
-                                x = (firstPosition.xDirAdj / pageWidth).coerceIn(0f, 1f),
-                                y = ((firstPosition.yDirAdj - firstPosition.heightDir / 2f) /
-                                    pageHeight).coerceIn(0f, 1f),
-                            ),
-                            pdfEndHandle = PdfSelectionPoint(
-                                x = ((lastPosition.xDirAdj + lastPosition.widthDirAdj) /
-                                    pageWidth).coerceIn(0f, 1f),
-                                y = ((lastPosition.yDirAdj - lastPosition.heightDir / 2f) /
-                                    pageHeight).coerceIn(0f, 1f),
-                            ),
-                        )
-                    }
+                    val layout = loadPdfPageLayout(book, pageIndex)
+                    buildPdfSelection(
+                        pageIndex = pageIndex,
+                        layout = layout,
+                        startX = startX,
+                        startY = startY,
+                        endX = endX,
+                        endY = endY,
+                        highlightId = highlightId,
+                        movingHandle = movingHandle,
+                        previousStart = previousStart,
+                        previousEnd = previousEnd,
+                    )
                 }
                 coroutineContext.ensureActive()
                 if (selection == null) {
-                    showMessage("No selectable text was found at this position.")
-                } else {
-                    if (_uiState.value.book?.id == book.id) setSelection(selection)
+                    if (movingHandle == null) {
+                        showMessage("No selectable text was found at this position.")
+                    }
+                } else if (_uiState.value.book?.id == book.id) {
+                    setSelection(selection)
                 }
             } catch (error: CancellationException) {
                 throw error
@@ -488,21 +538,92 @@ class ReaderViewModel(
         }
     }
 
-    private fun wordRangeAt(
-        positions: List<TextPosition>,
-        selectedIndex: Int,
-    ): IntRange? {
-        fun isWordPosition(index: Int): Boolean {
-            val character = positions.getOrNull(index)?.unicode?.firstOrNull() ?: return false
-            return character.isLetterOrDigit() || character == '\'' || character == '-'
+    private fun buildPdfSelection(
+        pageIndex: Int,
+        layout: PdfPageLayout,
+        startX: Float,
+        startY: Float,
+        endX: Float,
+        endY: Float,
+        highlightId: Long?,
+        movingHandle: Boolean?,
+        previousStart: PdfSelectionPoint?,
+        previousEnd: PdfSelectionPoint?,
+    ): ReaderSelection? {
+        val words = layout.words
+        if (words.isEmpty()) return null
+
+        val previousStartWord = if (movingHandle == true) {
+            previousStart?.let { PdfWordSnapper.snap(words, it.x, it.y) }
+        } else {
+            null
+        }
+        val previousEndWord = if (movingHandle == false) {
+            previousEnd?.let { PdfWordSnapper.snap(words, it.x, it.y) }
+        } else {
+            null
+        }
+        var firstWord = PdfWordSnapper.snap(
+            words = words,
+            xFraction = startX,
+            yFraction = startY,
+            previousWord = previousStartWord,
+        ) ?: return null
+        var lastWord = PdfWordSnapper.snap(
+            words = words,
+            xFraction = endX,
+            yFraction = endY,
+            previousWord = previousEndWord,
+        ) ?: return null
+
+        if (firstWord.charStart > lastWord.charStart) {
+            when (movingHandle) {
+                true -> firstWord = lastWord
+                false -> lastWord = firstWord
+                null -> {
+                    val swap = firstWord
+                    firstWord = lastWord
+                    lastWord = swap
+                }
+            }
         }
 
-        if (!isWordPosition(selectedIndex)) return null
-        var first = selectedIndex
-        var last = selectedIndex
-        while (isWordPosition(first - 1)) first--
-        while (isWordPosition(last + 1)) last++
-        return first..last
+        val charStart = firstWord.charStart.coerceIn(0, layout.text.length)
+        val charEnd = lastWord.charEnd.coerceIn(charStart, layout.text.length)
+        val selectedText = layout.text.substring(charStart, charEnd).trim()
+        if (selectedText.isEmpty()) return null
+
+        val rectOf: (PdfWordBounds) -> PdfSelectionRect = { word ->
+            PdfSelectionRect(word.left, word.top, word.right, word.bottom)
+        }
+        val highlightRects = mergePdfSelectionRects(
+            layout.charRects.subList(charStart, charEnd).filterNotNull(),
+        ).ifEmpty {
+            mergePdfSelectionRects(
+                words
+                    .filter { it.charEnd > charStart && it.charStart < charEnd }
+                    .map(rectOf),
+            )
+        }
+        if (highlightRects.isEmpty()) return null
+
+        return ReaderSelection(
+            chapterIndex = pageIndex,
+            chapterTitle = "Page ${pageIndex + 1}",
+            text = selectedText,
+            startOffset = charStart,
+            endOffset = charEnd,
+            pdfHighlightRects = highlightRects,
+            pdfStartHandle = PdfSelectionPoint(
+                x = firstWord.left.coerceIn(0f, 1f),
+                y = firstWord.centerY.coerceIn(0f, 1f),
+            ),
+            pdfEndHandle = PdfSelectionPoint(
+                x = lastWord.right.coerceIn(0f, 1f),
+                y = lastWord.centerY.coerceIn(0f, 1f),
+            ),
+            highlightId = highlightId,
+        )
     }
 
     fun clearSelection() {
@@ -553,8 +674,8 @@ class ReaderViewModel(
         val book = state.book
         if (book?.format?.equals("PDF", ignoreCase = true) == true) {
             pdfHighlightsJob?.cancel()
-            pdfHighlightsJob = viewModelScope.launch {
-                database.highlightDao().getHighlightsForPage(book.id, page).collect { highlights ->
+            pdfHighlightsJob = guardedLaunch {
+                database.highlightDao().getHighlightsForChapter(book.id, page).collect { highlights ->
                     val current = _uiState.value
                     if (current.book?.id == book.id && current.pdfPageIndex == page) {
                         _uiState.value = current.copy(savedPdfHighlights = highlights)
@@ -562,7 +683,7 @@ class ReaderViewModel(
                 }
             }
             pdfPageTextJob?.cancel()
-            pdfPageTextJob = viewModelScope.launch {
+            pdfPageTextJob = guardedLaunch {
                 try {
                     val text = withContext(Dispatchers.IO) { extractPdfPageText(book, page) }
                     val current = _uiState.value
@@ -628,7 +749,7 @@ class ReaderViewModel(
             if (!renderingPages.add(renderKey)) return
         }
 
-        viewModelScope.launch {
+        guardedLaunch {
             var shouldPersistToDisk = false
             try {
                 val bitmap = withContext(Dispatchers.IO) {
@@ -678,7 +799,7 @@ class ReaderViewModel(
                     )
                 }
                 if (shouldPersistToDisk) {
-                    viewModelScope.launch(Dispatchers.IO) {
+                    guardedLaunch(Dispatchers.IO) {
                         PdfPageCache.putDisk(appContext, cacheBookKey, page, targetWidth, bitmap)
                     }
                 }
@@ -706,19 +827,30 @@ class ReaderViewModel(
 
     fun updateEpubProgress(chapterIndex: Int, scrollOffsetPx: Int, progress: Float) {
         val chapter = chapterIndex.coerceIn(0, (_uiState.value.chapters.size - 1).coerceAtLeast(0))
+        currentEpubChapter = chapter
         persistProgress("epub:$chapter:${scrollOffsetPx.coerceAtLeast(0)}", progress.coerceIn(0f, 1f))
     }
 
     fun saveSelectedQuote() {
         val selection = _uiState.value.selection ?: return
-        viewModelScope.launch {
+        guardedLaunch {
             setWorking(true)
             try {
+                val text = sanitizeStoredText(selection.text)
+                if (text.isEmpty()) {
+                    showMessage("This selection is empty and cannot be saved as a quote.")
+                    return@guardedLaunch
+                }
                 database.quoteDao().upsert(
                     QuoteEntity(
-                        bookId = _uiState.value.book?.id ?: return@launch,
-                        text = selection.text,
-                        chapter = selection.chapterTitle,
+                        bookId = _uiState.value.book?.id
+                            ?: throw IOException("Open a book before saving a quote."),
+                        selectedText = text,
+                        chapter = selection.chapterTitle.take(MAX_META_TEXT_CHARS),
+                        chapterIndex = selection.chapterIndex.coerceAtLeast(0),
+                        characterOffset = selection.startOffset.coerceAtLeast(0),
+                        endCharacterOffset = selection.endOffset.coerceAtLeast(0),
+                        source = QuoteSource.USER,
                     ),
                 )
                 clearSelection()
@@ -726,7 +858,7 @@ class ReaderViewModel(
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
-                showMessage(error.localizedMessage ?: "Could not save this quote.")
+                showFailureMessage(error)
             } finally {
                 setWorking(false)
             }
@@ -735,38 +867,206 @@ class ReaderViewModel(
 
     fun saveHighlight() {
         val selection = _uiState.value.selection ?: return
-        viewModelScope.launch {
+        if (selection.highlightId != null) {
+            showMessage("This passage is already highlighted.")
+            return
+        }
+        guardedLaunch {
             setWorking(true)
             try {
-                val bookId = _uiState.value.book?.id ?: return@launch
-                database.highlightDao().upsert(
-                    HighlightEntity(
-                        bookId = bookId,
-                        text = selection.text,
-                        startOffset = selection.startOffset,
-                        endOffset = selection.endOffset,
-                        note = selection.chapterTitle,
-                        pageIndex = selection.chapterIndex.takeIf {
-                            _uiState.value.book?.format.equals("PDF", ignoreCase = true)
-                        },
-                        startCharOffset = selection.startOffset,
-                        endCharOffset = selection.endOffset,
-                        colorHex = "#FFFF00",
-                        boundsJson = selection.pdfHighlightRects
-                            .takeIf { it.isNotEmpty() }
-                            ?.let(::encodePdfHighlightBounds),
-                    ),
-                )
+                val book = _uiState.value.book
+                    ?: throw IOException("Open a book before highlighting.")
+                val entity = withContext(Dispatchers.IO) {
+                    buildSanitizedHighlight(selection, book)
+                }
+                if (entity == null) {
+                    showMessage("This selection is empty and cannot be highlighted.")
+                    return@guardedLaunch
+                }
+                database.highlightDao().upsert(entity)
                 clearSelection()
                 showMessage("Highlight saved.")
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
-                showMessage(error.localizedMessage ?: "Could not save this highlight.")
+                showFailureMessage(error)
             } finally {
                 setWorking(false)
             }
         }
+    }
+
+    /**
+     * Builds a database-safe highlight row: trims and caps oversized text
+     * (prevents SQLiteBlobTooBigException), drops non-finite/out-of-range
+     * highlight rectangles, and bounds every stored field. Returns null when
+     * nothing meaningful is left after sanitizing.
+     */
+    private fun buildSanitizedHighlight(
+        selection: ReaderSelection,
+        book: BookEntity,
+    ): HighlightEntity? {
+        val text = sanitizeStoredText(selection.text)
+        if (text.isEmpty()) return null
+        val isPdf = book.format.equals("PDF", ignoreCase = true)
+        val safeRects = selection.pdfHighlightRects
+            .filter(PdfSelectionRect::isValid)
+            .take(MAX_HIGHLIGHT_RECTS)
+        val note = selection.chapterTitle.trim().take(MAX_META_TEXT_CHARS).ifBlank { null }
+        val start = selection.startOffset.coerceAtLeast(0)
+        val end = selection.endOffset.coerceAtLeast(start)
+        return HighlightEntity(
+            bookId = book.id,
+            selectedText = text,
+            chapterIndex = selection.chapterIndex.coerceAtLeast(0),
+            characterOffset = start,
+            endCharacterOffset = end,
+            startOffset = start,
+            endOffset = end,
+            note = note,
+            pageIndex = selection.chapterIndex.takeIf { isPdf },
+            startCharOffset = start,
+            endCharOffset = end,
+            colorHex = "#FFFF00",
+            boundsJson = safeRects
+                .takeIf { it.isNotEmpty() }
+                ?.let(::encodePdfHighlightBounds),
+        )
+    }
+
+    /** Trims and caps stored text so oversized rows cannot crash SQLite. */
+    private fun sanitizeStoredText(text: String): String =
+        text.trim().take(MAX_STORED_TEXT_CHARS).trim()
+
+    fun deleteHighlight(highlight: com.example.vibereader.data.room.HighlightEntity) {
+        guardedLaunch {
+            try {
+                database.highlightDao().delete(highlight)
+                showMessage("Highlight removed.")
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                showMessage(error.localizedMessage ?: "Could not remove this highlight.")
+            }
+        }
+    }
+
+    fun askBookAi(question: String) {
+        val trimmedQuestion = question.trim()
+        if (trimmedQuestion.isEmpty()) return
+        val book = _uiState.value.book ?: return
+        // A synchronous guard prevents double-taps from starting two requests
+        // whose finally blocks could unlock "Working…" while the other is live.
+        if (_uiState.value.isWorking) return
+        setWorking(true)
+        _uiState.value = _uiState.value.copy(aiResult = null)
+        guardedLaunch(Dispatchers.IO) {
+            try {
+                val contextText = resolveAskAiContext(book)
+                if (contextText.isBlank()) {
+                    val message = "Open a page or select text before asking."
+                    showAiError(book, "Ask Book AI", message)
+                    return@guardedLaunch
+                }
+                val response = withTimeout(MAX_AI_OPERATION_MS) {
+                    askAiEngine.askBook(
+                        context = AskAiEngine.BookContext(
+                            bookTitle = book.title,
+                            author = book.author,
+                            contextText = contextText,
+                        ),
+                        question = trimmedQuestion,
+                    )
+                }
+                if (_uiState.value.book?.id == book.id) {
+                    _uiState.value = _uiState.value.copy(
+                        aiResult = AiTaskResult("Ask Book AI", response),
+                    )
+                }
+            } catch (timeout: TimeoutCancellationException) {
+                Log.e(AI_ERROR_TAG, "Execution error", timeout)
+                showAiError(book, "Ask Book AI failed", AI_TIMEOUT_MESSAGE)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Log.e(AI_ERROR_TAG, "Execution error", error)
+                showAiError(
+                    book = book,
+                    title = "Ask Book AI failed",
+                    message = error.toAiUiMessage("Could not answer this question."),
+                )
+            } finally {
+                setWorking(false)
+            }
+        }
+    }
+
+    /**
+     * Publishes a visible error card in the Book Assistant sheet, keeps the
+     * transient Snackbar for parity with other reader actions, and force-emits a
+     * Toast so the user never sees a silent AI failure.
+     */
+    private fun showAiError(book: BookEntity, title: String, message: String) {
+        val clean = message.trim().ifBlank { AiFailoverManager.ALL_KEYS_FAILED_MESSAGE }
+        Log.e(AI_ERROR_TAG, "Execution error: $title - $clean")
+        if (_uiState.value.book?.id != book.id) return
+        _uiState.value = _uiState.value.copy(
+            aiResult = AiTaskResult(
+                title = title,
+                content = clean,
+                isError = true,
+            ),
+        )
+        showMessage(clean)
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(appContext, "AI Error: $clean", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun Throwable.toAiUiMessage(fallback: String): String = when (this) {
+        is AiConfigurationException ->
+            localizedMessage?.takeIf(String::isNotBlank)
+                ?: AiRuntimeResolver.SETUP_ERROR_MESSAGE
+
+        is AiRequestException ->
+            localizedMessage?.takeIf(String::isNotBlank)
+                ?: AiFailoverManager.ALL_KEYS_FAILED_MESSAGE
+
+        else ->
+            "AI Error: " + (
+                localizedMessage?.takeIf(String::isNotBlank)
+                    ?: message?.takeIf(String::isNotBlank)
+                    ?: fallback
+                )
+    }
+
+    /**
+     * Builds the exact context sent with an Ask AI question. Priority:
+     * selected text, the visible PDF page, then the chapter the reader is
+     * actually on (not merely the initially restored chapter).
+     */
+    private suspend fun resolveAskAiContext(book: BookEntity): String {
+        val state = _uiState.value
+        state.selection?.text
+            ?.takeIf(String::isNotBlank)
+            ?.let { return it.take(MAX_ASK_CONTEXT_CHARS) }
+
+        if (book.format.equals("PDF", ignoreCase = true)) {
+            state.pdfPageText
+                .takeIf(String::isNotBlank)
+                ?.let { return it.take(MAX_ASK_CONTEXT_CHARS) }
+            return runCatching {
+                extractPdfPageText(book, state.pdfPageIndex)
+            }.getOrDefault("").take(MAX_ASK_CONTEXT_CHARS)
+        }
+
+        val chapters = state.chapters
+        if (chapters.isEmpty()) return ""
+        val chapterIndex = currentEpubChapter.coerceIn(0, chapters.size - 1)
+        return chapters[chapterIndex].text
+            .takeIf(String::isNotBlank)
+            ?.take(MAX_ASK_CONTEXT_CHARS)
+            .orEmpty()
     }
 
     fun extractMinimalistQuote() {
@@ -787,43 +1087,19 @@ class ReaderViewModel(
         runAiTask(AiTask.EXPLAIN, selection.text, book, selection.chapterTitle)
     }
 
-    fun translateSelection(targetLanguage: String) {
-        val selection = _uiState.value.selection ?: return
-        val book = _uiState.value.book ?: return
-        runAiTask(
-            AiTask.TRANSLATE,
-            selection.text,
-            book,
-            selection.chapterTitle,
-            targetLanguage = targetLanguage,
-        )
-    }
-
     fun summarizeChapter(chapterIndex: Int) {
         val state = _uiState.value
         val chapter = state.chapters.getOrNull(chapterIndex) ?: return
         val book = state.book ?: return
+        currentEpubChapter = chapterIndex.coerceAtLeast(0)
         runAiTask(AiTask.SUMMARIZE, chapter.text, book, chapter.title)
-    }
-
-    fun translateChapter(chapterIndex: Int, targetLanguage: String) {
-        val state = _uiState.value
-        val chapter = state.chapters.getOrNull(chapterIndex) ?: return
-        val book = state.book ?: return
-        runAiTask(
-            AiTask.TRANSLATE,
-            chapter.text,
-            book,
-            chapter.title,
-            targetLanguage = targetLanguage,
-        )
     }
 
     fun summarizePdfPage(pageIndex: Int) {
         val state = _uiState.value
         val book = state.book?.takeIf { it.format.equals("PDF", ignoreCase = true) } ?: return
         if (pageIndex !in 0 until state.pdfPageCount) return
-        viewModelScope.launch {
+        guardedLaunch {
             try {
                 val pageText = withContext(Dispatchers.IO) {
                     extractPdfPageText(book, pageIndex)
@@ -847,52 +1123,19 @@ class ReaderViewModel(
         }
     }
 
-    fun translatePdfPage(pageIndex: Int, targetLanguage: String) {
-        val state = _uiState.value
-        val book = state.book?.takeIf { it.format.equals("PDF", ignoreCase = true) } ?: return
-        if (pageIndex !in 0 until state.pdfPageCount) return
-        viewModelScope.launch {
-            try {
-                val pageText = withContext(Dispatchers.IO) {
-                    extractPdfPageText(book, pageIndex)
-                }
-                if (pageText.isBlank()) {
-                    showMessage("No text could be extracted from this PDF page.")
-                } else {
-                    runAiTask(
-                        AiTask.TRANSLATE,
-                        pageText,
-                        book,
-                        "Page ${pageIndex + 1}",
-                        targetLanguage = targetLanguage,
-                        processingPageIndex = pageIndex,
-                    )
-                }
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                showMessage(error.localizedMessage ?: "Could not read this PDF page.")
-            }
-        }
-    }
-
     fun readPdfPageText(pageIndex: Int, onTextReady: (String) -> Unit) {
         val state = _uiState.value
         val book = state.book?.takeIf { it.format.equals("PDF", ignoreCase = true) } ?: return
         if (pageIndex !in 0 until state.pdfPageCount) return
-        viewModelScope.launch {
+        guardedLaunch {
             try {
-                val speechPage = withContext(Dispatchers.IO) {
-                    extractPdfSpeechPage(book, pageIndex)
+                val layout = withContext(Dispatchers.IO) {
+                    loadPdfPageLayout(book, pageIndex)
                 }
-                if (speechPage.text.isBlank()) {
+                if (layout.text.isBlank()) {
                     showMessage("No readable text was found on this PDF page.")
                 } else {
-                    pdfSpeechPages[pageIndex] = speechPage
-                    while (pdfSpeechPages.size > MAX_CACHED_PDF_PAGES) {
-                        pdfSpeechPages.remove(pdfSpeechPages.keys.first())
-                    }
-                    onTextReady(speechPage.text)
+                    onTextReady(layout.text)
                 }
             } catch (error: CancellationException) {
                 throw error
@@ -906,32 +1149,116 @@ class ReaderViewModel(
         _uiState.value = _uiState.value.copy(aiResult = null)
     }
 
-    private fun extractPdfPageText(book: BookEntity, pageIndex: Int): String {
-        val file = File(book.filePath)
-        if (!file.isFile) throw IOException("The local PDF file is missing.")
-        PDFBoxResourceLoader.init(appContext)
-        return PDDocument.load(file).use { document ->
-            if (pageIndex !in 0 until document.numberOfPages) {
-                throw IOException("The requested PDF page is unavailable.")
+    private suspend fun extractPdfPageText(book: BookEntity, pageIndex: Int): String =
+        withContext(Dispatchers.IO) {
+            loadPdfPageLayout(book, pageIndex).text
+        }
+
+    /**
+     * Returns a cached PDFBox layout for [pageIndex]. Building the layout is
+     * expensive, so selection drags and TTS reuse the same word/character data.
+     *
+     * Race protection: concurrent callers for the same page (selection drag +
+     * page text + TTS can all arrive at once) share one extraction via a
+     * per-page gate, so at most one PDDocument is loaded at a time. Extraction
+     * itself never runs while holding [pdfLayoutLock], so the main thread can
+     * keep taking fast cache reads without ANR risk.
+     */
+    private fun loadPdfPageLayout(book: BookEntity, pageIndex: Int): PdfPageLayout {
+        while (true) {
+            synchronized(pdfLayoutLock) { pdfPageLayouts[pageIndex] }?.let { return it }
+
+            val inFlight = synchronized(pdfLayoutGateLock) { pdfLayoutGates[pageIndex] }
+            if (inFlight != null) {
+                // Wait for the running extraction to finish, then re-check cache.
+                synchronized(inFlight) {
+                    (inFlight as java.lang.Object).wait(PDF_LAYOUT_WAIT_TIMEOUT_MS)
+                }
+                continue
             }
-            PDFTextStripper().apply {
-                startPage = pageIndex + 1
-                endPage = pageIndex + 1
-            }.getText(document).trim()
+
+            val gate = Any()
+            val claimed = synchronized(pdfLayoutGateLock) {
+                if (pdfLayoutGates.contains(pageIndex)) {
+                    false
+                } else {
+                    pdfLayoutGates[pageIndex] = gate
+                    true
+                }
+            }
+            if (!claimed) continue
+            try {
+                val layout = extractPdfPageLayoutSafely(book, pageIndex)
+                if (_uiState.value.book?.id == book.id) {
+                    synchronized(pdfLayoutLock) {
+                        pdfPageLayouts[pageIndex] = layout
+                        while (pdfPageLayouts.size > MAX_CACHED_PDF_PAGES) {
+                            val oldest = pdfPageLayouts.keys.firstOrNull() ?: break
+                            pdfPageLayouts.remove(oldest)
+                        }
+                    }
+                }
+                return layout
+            } finally {
+                synchronized(pdfLayoutGateLock) { pdfLayoutGates.remove(pageIndex) }
+                synchronized(gate) { (gate as java.lang.Object).notifyAll() }
+            }
         }
     }
 
-    private fun extractPdfSpeechPage(book: BookEntity, pageIndex: Int): PdfSpeechPage {
+    /**
+     * Extracts one page, converting every failure — including Errors such as
+     * OutOfMemoryError that are common with hostile PDFs — into a friendly
+     * IOException the callers already handle by showing a Snackbar.
+     */
+    private fun extractPdfPageLayoutSafely(book: BookEntity, pageIndex: Int): PdfPageLayout =
+        try {
+            extractPdfPageLayout(book, pageIndex)
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (failure: Throwable) {
+            Log.w(TAG, "PDF page extraction failed (book=${book.id}, page=$pageIndex)", failure)
+            throw toFriendlyPdfError(failure)
+        }
+
+    private fun toFriendlyPdfError(error: Throwable): IOException = when (error) {
+        is OutOfMemoryError ->
+            IOException("Not enough memory to process this PDF page.", error)
+        is IllegalArgumentException, is IllegalStateException ->
+            IOException("This PDF page contains corrupt layout data.", error)
+        is IOException ->
+            error.localizedMessage
+                ?.takeIf(String::isNotBlank)
+                ?.let { IOException(it, error) }
+                ?: IOException("This PDF page could not be read.", error)
+        else ->
+            IOException(
+                error.localizedMessage?.takeIf(String::isNotBlank)
+                    ?: "This PDF page could not be read.",
+                error,
+            )
+    }
+
+    private fun extractPdfPageLayout(book: BookEntity, pageIndex: Int): PdfPageLayout {
         val file = File(book.filePath)
         if (!file.isFile) throw IOException("The local PDF file is missing.")
         PDFBoxResourceLoader.init(appContext)
-        return PDDocument.load(file).use { document ->
+        return PDDocument.load(file, MemoryUsageSetting.setupTempFileOnly()).use { document ->
             if (pageIndex !in 0 until document.numberOfPages) {
                 throw IOException("The requested PDF page is unavailable.")
             }
             val page = document.getPage(pageIndex)
-            val pageWidth = page.mediaBox.width.coerceAtLeast(1f)
-            val pageHeight = page.mediaBox.height.coerceAtLeast(1f)
+            val mediaBox = page.mediaBox
+                ?: throw IOException("The requested PDF page has invalid bounds.")
+            val pageWidth = mediaBox.width
+            val pageHeight = mediaBox.height
+            if (
+                !pageWidth.isFinite() || !pageHeight.isFinite() ||
+                pageWidth <= 0f || pageHeight <= 0f
+            ) {
+                throw IOException("The requested PDF page has invalid bounds.")
+            }
+
             val positions = mutableListOf<TextPosition>()
             val stripper = object : PDFTextStripper() {
                 override fun writeString(
@@ -946,7 +1273,13 @@ class ReaderViewModel(
                 endPage = pageIndex + 1
             }
             val text = stripper.getText(document).trim()
+            // Guard against pathological pages whose glyph data would allocate
+            // a rect list large enough to OOM-crash the app.
+            if (text.length > MAX_PDF_PAGE_TEXT_CHARS) {
+                throw IOException("This PDF page is too large to process.")
+            }
             val characterRects = MutableList<PdfSelectionRect?>(text.length) { null }
+            val glyphs = mutableListOf<PdfGlyph>()
             var searchFrom = 0
             positions.forEach { position ->
                 val unicode = position.unicode.orEmpty()
@@ -955,45 +1288,37 @@ class ReaderViewModel(
                 if (match < 0) return@forEach
                 val rect = PdfSelectionRect(
                     left = (position.xDirAdj / pageWidth).coerceIn(0f, 1f),
-                    top = ((position.yDirAdj - position.heightDir) / pageHeight).coerceIn(0f, 1f),
+                    top = ((position.yDirAdj - position.heightDir) / pageHeight)
+                        .coerceIn(0f, 1f),
                     right = ((position.xDirAdj + position.widthDirAdj) / pageWidth)
                         .coerceIn(0f, 1f),
                     bottom = (position.yDirAdj / pageHeight).coerceIn(0f, 1f),
                 )
-                repeat(unicode.length) { offset ->
-                    val charIndex = match + offset
-                    if (charIndex in characterRects.indices) characterRects[charIndex] = rect
+                if (rect.isValid) {
+                    repeat(unicode.length) { offset ->
+                        val charIndex = match + offset
+                        if (charIndex in characterRects.indices) {
+                            characterRects[charIndex] = rect
+                        }
+                    }
+                    glyphs += PdfGlyph(
+                        text = unicode,
+                        rect = rect,
+                        charStart = match,
+                        charEnd = match + unicode.length,
+                    )
                 }
                 searchFrom = match + unicode.length
             }
-            PdfSpeechPage(text, characterRects)
-        }
-    }
 
-    private fun mergeSpeechRects(rects: List<PdfSelectionRect>): List<PdfSelectionRect> {
-        val merged = mutableListOf<PdfSelectionRect>()
-        rects.groupBy { (it.top * 100).roundToInt() }
-            .toSortedMap()
-            .values
-            .forEach { lineRects ->
-                val sorted = lineRects.sortedBy(PdfSelectionRect::left)
-                var current: PdfSelectionRect? = null
-                sorted.forEach { rect ->
-                    val previous = current
-                    if (previous != null && rect.left <= previous.right + 0.015f) {
-                        current = previous.copy(
-                            right = maxOf(previous.right, rect.right),
-                            top = minOf(previous.top, rect.top),
-                            bottom = maxOf(previous.bottom, rect.bottom),
-                        )
-                    } else {
-                        current?.let(merged::add)
-                        current = rect
-                    }
-                }
-                current?.let(merged::add)
-            }
-        return merged
+            PdfPageLayout(
+                pageWidth = pageWidth,
+                pageHeight = pageHeight,
+                text = text,
+                charRects = characterRects,
+                words = PdfWordBuilder.build(glyphs),
+            )
+        }
     }
 
     private fun runAiTask(
@@ -1002,75 +1327,65 @@ class ReaderViewModel(
         book: BookEntity,
         chapterTitle: String,
         selection: ReaderSelection? = null,
-        targetLanguage: String = "",
         processingPageIndex: Int? = null,
     ) {
-        if (task == AiTask.TRANSLATE && targetLanguage.isBlank()) {
-            showMessage("Enter a target language before translating.")
-            return
-        }
         if (text.isBlank()) {
             showMessage("There is no readable text to send to the AI assistant.")
             return
         }
-        viewModelScope.launch {
-            if (processingPageIndex != null) {
-                _uiState.value = _uiState.value.copy(aiProcessingPageIndex = processingPageIndex)
-            }
-            setWorking(true)
+        if (_uiState.value.isWorking) return
+        if (processingPageIndex != null) {
+            _uiState.value = _uiState.value.copy(aiProcessingPageIndex = processingPageIndex)
+        }
+        setWorking(true)
+        _uiState.value = _uiState.value.copy(aiResult = null)
+        guardedLaunch(Dispatchers.IO) {
             try {
-                val config = withContext(Dispatchers.IO) {
-                    val store = ApiKeyStore(appContext)
-                    val provider = store.getSelectedAiProvider()
-                    val providerConfigs = store.getEnabledProviderConfigs(provider)
-                    val primary = providerConfigs.first()
-                    val apiKey = primary.apiKey.takeIf(String::isNotBlank)
-                        ?: throw IOException("Add an API key for the selected AI provider in Settings.")
-                    Triple(
-                        store,
-                        primary.copy(apiKey = apiKey),
-                        providerConfigs.drop(1),
-                    )
-                }
-                val response = withContext(Dispatchers.IO) {
+                val response = withTimeout(MAX_AI_OPERATION_MS) {
                     requestAiTaskForLongText(
-                        store = config.first,
-                        primary = config.second,
-                        fallbacks = config.third,
                         task = task,
                         text = text,
-                        targetLanguage = targetLanguage,
                     )
                 }
-                if (_uiState.value.book?.id != book.id) return@launch
-                if (task == AiTask.EXTRACT_QUOTE && selection != null) {
-                    val (header, quote) = parseQuote(response)
-                    database.quoteDao().upsert(
-                        QuoteEntity(
-                            bookId = book.id,
-                            text = "$header\n\n$quote",
-                            chapter = chapterTitle,
-                        ),
-                    )
-                    clearSelection()
-                    showMessage("AI quote saved.")
-                } else {
-                    _uiState.value = _uiState.value.copy(
-                        aiResult = AiTaskResult(
-                            if (task == AiTask.TRANSLATE) {
-                                "Translation to ${targetLanguage.trim()} · $chapterTitle"
-                            } else {
-                                "${task.title} · $chapterTitle"
-                            },
-                            response,
-                        ),
-                    )
+                if (_uiState.value.book?.id == book.id) {
+                    if (task == AiTask.EXTRACT_QUOTE && selection != null) {
+                        val (header, quote) = parseQuote(response)
+                        database.quoteDao().upsert(
+                            QuoteEntity(
+                                bookId = book.id,
+                                selectedText = sanitizeStoredText("$header\n\n$quote"),
+                                chapter = chapterTitle.take(MAX_META_TEXT_CHARS),
+                                chapterIndex = selection.chapterIndex.coerceAtLeast(0),
+                                characterOffset = selection.startOffset.coerceAtLeast(0),
+                                endCharacterOffset = selection.endOffset.coerceAtLeast(0),
+                                source = QuoteSource.AI,
+                            ),
+                        )
+                        clearSelection()
+                        showMessage("AI quote saved.")
+                    } else {
+                        _uiState.value = _uiState.value.copy(
+                            aiResult = AiTaskResult(
+                                "${task.title} · $chapterTitle",
+                                response,
+                            ),
+                        )
+                    }
                 }
-
+            } catch (timeout: TimeoutCancellationException) {
+                Log.e(AI_ERROR_TAG, "Execution error", timeout)
+                showAiError(book, "${task.title} failed", AI_TIMEOUT_MESSAGE)
             } catch (error: CancellationException) {
                 throw error
-            } catch (error: Exception) {
-                showMessage(error.localizedMessage ?: "AI ${task.title.lowercase()} failed.")
+            } catch (error: Throwable) {
+                Log.e(AI_ERROR_TAG, "Execution error", error)
+                showAiError(
+                    book = book,
+                    title = "${task.title} failed",
+                    message = error.toAiUiMessage(
+                        "AI ${task.title.lowercase()} failed. Please try again.",
+                    ),
+                )
             } finally {
                 setWorking(false)
                 if (processingPageIndex != null) {
@@ -1101,7 +1416,7 @@ class ReaderViewModel(
     private fun persistProgress(location: String, progress: Float) {
         val bookId = _uiState.value.book?.id ?: return
         progressJob?.cancel()
-        progressJob = viewModelScope.launch {
+        progressJob = guardedLaunch {
             kotlinx.coroutines.delay(PROGRESS_SAVE_DELAY_MS)
             try {
                 database.readingProgressDao().upsert(
@@ -1118,51 +1433,6 @@ class ReaderViewModel(
 
     private fun setWorking(isWorking: Boolean) {
         _uiState.value = _uiState.value.copy(isWorking = isWorking)
-    }
-
-    private fun requestAiTaskForLongText(
-        store: ApiKeyStore,
-        primary: ProviderKeyConfig,
-        fallbacks: List<ProviderKeyConfig>,
-        task: AiTask,
-        text: String,
-        targetLanguage: String,
-    ): String {
-        if (task == AiTask.EXTRACT_QUOTE || text.length <= MAX_AI_CHUNK_CHARS) {
-            return requestAiTaskWithFallback(
-                store,
-                primary,
-                fallbacks,
-                task,
-                text,
-                targetLanguage,
-            )
-        }
-        val chunks = splitAiText(text, MAX_AI_CHUNK_CHARS)
-        val partialResults = chunks.mapIndexed { index, chunk ->
-            requestAiTaskWithFallback(
-                store,
-                primary,
-                fallbacks,
-                task,
-                chunk,
-                targetLanguage,
-            ).let { result ->
-                if (task == AiTask.SUMMARIZE) "Part ${index + 1}: $result" else result
-            }
-        }
-        return if (task == AiTask.SUMMARIZE && partialResults.size > 1) {
-            requestAiTaskWithFallback(
-                store,
-                primary,
-                fallbacks,
-                AiTask.SUMMARIZE,
-                partialResults.joinToString("\n\n"),
-                targetLanguage,
-            )
-        } else {
-            partialResults.joinToString(separator = "\n\n")
-        }
     }
 
     private fun splitAiText(text: String, maxChunkChars: Int): List<String> {
@@ -1190,121 +1460,38 @@ class ReaderViewModel(
         return chunks
     }
 
-    private fun requestAiTaskWithFallback(
-        store: ApiKeyStore,
-        primary: ProviderKeyConfig,
-        fallbacks: List<ProviderKeyConfig>,
+    private suspend fun requestAiTaskForLongText(
         task: AiTask,
-        selectedText: String,
-        targetLanguage: String,
+        text: String,
     ): String {
-        val configs = listOf(primary) + fallbacks
-        var lastRateLimit: AiProviderHttpException? = null
-        configs.forEachIndexed { index, config ->
-            val model = store.getAiModel(config.provider)
-                ?.takeIf(String::isNotBlank)
-                ?: config.provider.defaultModel
-            try {
-                return requestAiTask(
-                    config.provider,
-                    config.apiKey,
-                    model,
-                    task,
-                    selectedText,
-                    targetLanguage,
-                )
-            } catch (error: AiProviderHttpException) {
-                if (error.statusCode != HTTP_TOO_MANY_REQUESTS) throw error
-                lastRateLimit = error
-                if (index == configs.lastIndex) throw error
+        if (task == AiTask.EXTRACT_QUOTE || text.length <= MAX_AI_CHUNK_CHARS) {
+            return requestAiTask(task, text)
+        }
+        val chunks = splitAiText(text, MAX_AI_CHUNK_CHARS)
+        val partialResults = chunks.mapIndexed { index, chunk ->
+            requestAiTask(task, chunk).let { result ->
+                if (task == AiTask.SUMMARIZE) "Part ${index + 1}: $result" else result
             }
         }
-        throw lastRateLimit ?: IOException("No enabled AI provider is available.")
+        return if (task == AiTask.SUMMARIZE && partialResults.size > 1) {
+            requestAiTask(AiTask.SUMMARIZE, partialResults.joinToString("\n\n"))
+        } else {
+            partialResults.joinToString(separator = "\n\n")
+        }
     }
 
-    private fun requestAiTask(
-        provider: AiProvider,
-        apiKey: String,
-        model: String,
-        task: AiTask,
-        selectedText: String,
-        targetLanguage: String,
-    ): String {
-        val normalizedTargetLanguage = when (targetLanguage.trim().lowercase()) {
-            "bn", "bangla", "bengali" -> "Bangla (Bengali)"
-            else -> targetLanguage.trim()
-        }
-        val systemPrompt = when (task) {
-            AiTask.SUMMARIZE ->
-                "Summarize only the supplied book excerpt faithfully. Do not invent details."
-            AiTask.EXPLAIN ->
-                "Explain the supplied book excerpt clearly and faithfully. Do not invent details."
-            AiTask.EXTRACT_QUOTE ->
-                "Extract one concise, faithful quote from the supplied text. Return only valid JSON " +
-                    "with exactly two string fields: \"header\" (one uppercase word) and \"quote\" " +
-                    "(the meaningful excerpt). Do not add facts or commentary."
-            AiTask.TRANSLATE ->
-                "You are an expert literary translator. Translate the provided book content directly " +
-                    "into $normalizedTargetLanguage. Maintain the original tone and formatting. " +
-                    "Provide only the translated text without extra conversational commentary."
-        }
-        val payload = JSONObject()
-            .put("model", model)
-            .put("temperature", 0.3)
-            .put(
-                "messages",
-                org.json.JSONArray()
-                    .put(
-                        JSONObject()
-                            .put(
-                                "role",
-                                "system",
-                            )
-                            .put("content", systemPrompt),
-                    )
-                    .put(
-                        JSONObject()
-                            .put("role", "user")
-                            .put(
-                                "content",
-                                if (task == AiTask.TRANSLATE) {
-                                    "Target Language: $normalizedTargetLanguage\n\n" +
-                                        "Content to Translate:\n$selectedText"
-                                } else {
-                                    selectedText
-                                },
-                            ),
-                    ),
-            )
-        val request = Request.Builder()
-            .url("${provider.baseUrl.trimEnd('/')}/chat/completions")
-            .header("Authorization", "Bearer $apiKey")
-            .apply {
-                if (provider == AiProvider.OPENROUTER) {
-                    header("HTTP-Referer", APP_REFERER)
-                    header("X-Title", APP_TITLE)
-                }
-            }
-            .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
-            .build()
-        return httpClient.newCall(request).execute().use { response ->
-            val body = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw AiProviderHttpException(
-                    statusCode = response.code,
-                    message = "${provider.displayName} returned HTTP ${response.code}: " +
-                        body.take(MAX_AI_ERROR_BODY_CHARS),
-                )
-            }
-            JSONObject(body)
-                .getJSONArray("choices")
-                .getJSONObject(0)
-                .getJSONObject("message")
-                .getString("content")
-                .trim()
-                .takeIf(String::isNotBlank)
-                ?: throw IOException("AI provider returned an empty response.")
-        }
+    /**
+     * Runs one chunk through [AskAiEngine], which resolves the provider/key/model
+     * failover pool on every request and transparently tries the next saved
+     * provider on 401/429/network errors before surfacing a single UI error.
+     */
+    private suspend fun requestAiTask(task: AiTask, selectedText: String): String =
+        askAiEngine.runTask(task.toReaderTask(), selectedText)
+
+    private fun AiTask.toReaderTask(): AskAiEngine.Task = when (this) {
+        AiTask.SUMMARIZE -> AskAiEngine.Task.SUMMARIZE
+        AiTask.EXPLAIN -> AskAiEngine.Task.EXPLAIN
+        AiTask.EXTRACT_QUOTE -> AskAiEngine.Task.EXTRACT_QUOTE
     }
 
     private fun parseQuote(response: String): Pair<String, String> {
@@ -1340,7 +1527,6 @@ class ReaderViewModel(
 
     override fun onCleared() {
         closePdfRenderer()
-        httpClient.dispatcher.cancelAll()
         super.onCleared()
     }
 
@@ -1358,17 +1544,24 @@ class ReaderViewModel(
     }
 
     private companion object {
-        const val HTTP_TOO_MANY_REQUESTS = 429
-        const val MAX_AI_ERROR_BODY_CHARS = 300
+        const val TAG = "ReaderViewModel"
+        const val AI_ERROR_TAG = "VibeReader_AI"
         const val MAX_AI_CHUNK_CHARS = 12_000
-        const val APP_REFERER = "https://vibereader.app"
-        const val APP_TITLE = "VibeReader"
+        const val MAX_ASK_CONTEXT_CHARS = 12_000
+        /** Hard ceiling for a whole AI action, including chunked summaries. */
+        const val MAX_AI_OPERATION_MS = 180_000L
+        const val AI_TIMEOUT_MESSAGE =
+            "The AI request timed out. Check your internet connection and try again."
+        const val MAX_STORED_TEXT_CHARS = 100_000
+        const val MAX_META_TEXT_CHARS = 240
+        const val MAX_HIGHLIGHT_RECTS = 2000
         const val MAX_PDF_RENDER_WIDTH = 3072
         const val MAX_PDF_BITMAP_PIXELS = 12_000_000L
         const val MAX_PDF_BITMAP_DIMENSION = 8192
         const val MAX_CACHED_PDF_PAGES = 3
+        const val MAX_PDF_PAGE_TEXT_CHARS = 1_000_000
+        const val PDF_LAYOUT_WAIT_TIMEOUT_MS = 250L
         const val PROGRESS_SAVE_DELAY_MS = 500L
-        val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val EPUB_LOCATION_REGEX = Regex("""epub:(\d+):(\d+)""")
     }
 
@@ -1392,12 +1585,6 @@ class ReaderViewModel(
         SUMMARIZE("Summary"),
         EXPLAIN("Explanation"),
         EXTRACT_QUOTE("Quote extraction"),
-        TRANSLATE("Translation"),
     }
-
-    private class AiProviderHttpException(
-        val statusCode: Int,
-        message: String,
-    ) : IOException(message)
 
 }

@@ -46,12 +46,13 @@ fun SafeZoomablePdfCanvas(
     modifier: Modifier = Modifier,
     onCanvasTap: () -> Unit,
     onTextLongPress: (pageIndex: Int, xFraction: Float, yFraction: Float) -> Unit,
-    onSelectionHandleDragEnd: (
+    onSelectionHandleDrag: (
         pageIndex: Int,
         isStartHandle: Boolean,
         xFraction: Float,
         yFraction: Float,
     ) -> Unit,
+    onHighlightTap: (com.example.vibereader.data.room.HighlightEntity) -> Unit,
     onZoomChanged: (Float) -> Unit,
 ) {
     var scale by remember(pageIndex) { mutableFloatStateOf(MIN_SCALE) }
@@ -162,6 +163,8 @@ fun SafeZoomablePdfCanvas(
             pageWidthPx = bitmap.width,
             pageHeightPx = bitmap.height,
             fitToBounds = fitToBounds,
+            selection = selection,
+            savedHighlights = savedHighlights,
             onCanvasTap = onCanvasTap,
             onDoubleTap = {
                 val nextScale = if (scale > MIN_SCALE) MIN_SCALE else DOUBLE_TAP_SCALE
@@ -170,6 +173,8 @@ fun SafeZoomablePdfCanvas(
                 onZoomChanged(nextScale)
             },
             onTextLongPress = onTextLongPress,
+            onSelectionHandleDrag = onSelectionHandleDrag,
+            onHighlightTap = onHighlightTap,
         )
         if (selectionRects.isNotEmpty() || selection?.pdfStartHandle != null) {
             PdfSelectionOverlay(
@@ -178,9 +183,7 @@ fun SafeZoomablePdfCanvas(
                 pageWidthPx = bitmap.width,
                 pageHeightPx = bitmap.height,
                 fitToBounds = fitToBounds,
-                onHandleDragEnd = { isStart, x, y ->
-                    onSelectionHandleDragEnd(pageIndex, isStart, x, y)
-                },
+                zoomScale = scale,
                 modifier = Modifier
                     .matchParentSize()
                     .graphicsLayer {

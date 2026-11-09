@@ -6,6 +6,7 @@ import android.net.Uri
 import android.provider.MediaStore
 import android.util.Log
 import androidx.documentfile.provider.DocumentFile
+import com.example.vibereader.util.FilenameSanitizer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.IOException
@@ -99,7 +100,7 @@ class DeviceBookScanner(context: Context) {
                 val uri = ContentUris.withAppendedId(collection, it.getLong(idColumn))
                 result[uri.toString()] = ScannedBook(
                     uri = uri,
-                    title = name.withoutExtension(),
+                    title = FilenameSanitizer.cleanBookTitle(name).ifBlank { "Untitled Book" },
                     format = format,
                     sizeBytes = it.getLong(sizeColumn).coerceAtLeast(0),
                     modifiedAt = it.getLong(modifiedColumn).coerceAtLeast(0) * 1_000,
@@ -154,7 +155,7 @@ class DeviceBookScanner(context: Context) {
                 val format = resolveFormat(name, file.type) ?: continue
                 results += ScannedBook(
                     uri = file.uri,
-                    title = name.withoutExtension(),
+                    title = FilenameSanitizer.cleanBookTitle(name).ifBlank { "Untitled Book" },
                     format = format,
                     sizeBytes = file.length().coerceAtLeast(0),
                     modifiedAt = file.lastModified().coerceAtLeast(0),
@@ -170,8 +171,6 @@ class DeviceBookScanner(context: Context) {
         name.endsWith(".epub", ignoreCase = true) || mimeType == EPUB_MIME_TYPE -> "EPUB"
         else -> null
     }
-
-    private fun String.withoutExtension(): String = substringBeforeLast('.', this)
 
     companion object {
         private const val TAG = "VibeReaderScan"

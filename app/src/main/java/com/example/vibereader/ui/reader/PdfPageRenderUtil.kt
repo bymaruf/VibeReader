@@ -1,11 +1,26 @@
 package com.example.vibereader.ui.reader
 
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.pdf.PdfRenderer
+import android.util.Log
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+
+private const val TAG = "PdfPageRenderUtil"
+
+/**
+ * Single-thread serializer for Android [PdfRenderer] access. [PdfRenderer] and
+ * its pages are not thread-safe; all `openPage`/`render`/`close` operations for
+ * the same renderer must run on this dispatcher (or equivalent serialization)
+ * to prevent concurrent thread locking/freezes on scanned/vector PDFs.
+ */
+internal val PDF_RENDER_DISPATCHER: CoroutineDispatcher =
+    Dispatchers.IO.limitedParallelism(1)
 
 internal fun calculateFitScale(
     pageWidth: Int,
@@ -22,6 +37,15 @@ internal fun calculateFitScale(
     return minOf(widthScale, heightScale)
 }
 
+/**
+ * Renders [page] into a crisp bitmap sized for the requested target.
+ *
+ * The caller owns [page] lifecycle (`openPage`/`close` in `finally`) and must
+ * serialize [PdfRenderer] access (see [PDF_RENDER_DISPATCHER]). Bitmap
+ * allocation and native rendering are wrapped in try-catch so memory pressure
+ * or a problematic page falls back safely (returns `null`) instead of hanging
+ * the UI on an indefinite loading spinner.
+ */
 internal fun renderPageCrisp(
     page: PdfRenderer.Page,
     targetWidth: Int,
@@ -44,21 +68,30 @@ internal fun renderPageCrisp(
     } else {
         targetWidth.toFloat() / page.width
     }
+    if (!fitScale.isFinite() || fitScale <= 0f) return null
+
     val requestedScale = fitScale * zoomScale
-    val maxScaleForPixels = sqrt(
-        maxBitmapPixels.toDouble() / (page.width.toDouble() * page.height),
-    ).toFloat()
-    val maxScaleForDimension = maxBitmapDimension.toFloat() / maxOf(page.width, page.height)
+    val pagePixels = page.width.toDouble() * page.height.toDouble()
+    val maxScaleForPixels = if (pagePixels > 0.0) {
+        sqrt(maxBitmapPixels.toDouble() / pagePixels).toFloat()
+    } else {
+        0f
+    }
+    val maxScaleForDimension =
+        maxBitmapDimension.toFloat() / maxOf(page.width, page.height).coerceAtLeast(1)
     val scale = minOf(requestedScale, maxScaleForPixels, maxScaleForDimension)
     if (!scale.isFinite() || scale <= 0f) return null
 
-    val width = (page.width * scale).roundToInt().coerceAtLeast(1)
-    val height = (page.height * scale).roundToInt().coerceAtLeast(1)
+    val width = (page.width * scale).roundToInt().coerceIn(1, maxBitmapDimension)
+    val height = (page.height * scale).roundToInt().coerceIn(1, maxBitmapDimension)
+    val pixelCount = width.toLong() * height.toLong()
+    if (pixelCount <= 0L || pixelCount > maxBitmapPixels) return null
+
     var bitmap: Bitmap? = null
     return try {
         val createdBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         bitmap = createdBitmap
-        createdBitmap.eraseColor(android.graphics.Color.WHITE)
+        createdBitmap.eraseColor(Color.WHITE)
         val matrix = Matrix().apply { setScale(scale, scale) }
         page.render(
             createdBitmap,
@@ -67,8 +100,83 @@ internal fun renderPageCrisp(
             PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY,
         )
         createdBitmap
-    } catch (_: OutOfMemoryError) {
-        bitmap?.recycle()
+    } catch (error: OutOfMemoryError) {
+        Log.w(TAG, "PDF bitmap OOM (${width}x$height); falling back to preview-safe failure.", error)
+        runCatching { bitmap?.recycle() }
+        bitmap = null
+        // Fall back to a minimal readable preview bitmap when possible, so the
+        // page does not hang on an infinite loading spinner.
+        createPreviewFallback(page, maxBitmapDimension)
+    } catch (error: Throwable) {
+        Log.w(TAG, "PDF page render failed; falling back safely.", error)
+        runCatching { bitmap?.recycle() }
         null
+    }
+}
+
+/**
+ * Best-effort low-resolution fallback after OOM. Returns `null` if even a small
+ * allocation cannot be satisfied.
+ */
+private fun createPreviewFallback(page: PdfRenderer.Page, maxBitmapDimension: Int): Bitmap? {
+    val previewMax = minOf(720, maxBitmapDimension.coerceAtLeast(1))
+    val longest = maxOf(page.width, page.height).coerceAtLeast(1)
+    val scale = (previewMax.toFloat() / longest.toFloat()).coerceIn(0.05f, 1f)
+    val width = (page.width * scale).roundToInt().coerceAtLeast(1)
+    val height = (page.height * scale).roundToInt().coerceAtLeast(1)
+    var bitmap: Bitmap? = null
+    return try {
+        val createdBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        bitmap = createdBitmap
+        createdBitmap.eraseColor(Color.WHITE)
+        val matrix = Matrix().apply { setScale(scale, scale) }
+        page.render(
+            createdBitmap,
+            Rect(0, 0, width, height),
+            matrix,
+            PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY,
+        )
+        createdBitmap
+    } catch (_: Throwable) {
+        runCatching { bitmap?.recycle() }
+        null
+    }
+}
+
+/**
+ * Opens, renders, and always closes a [PdfRenderer.Page] on the caller's
+ * (serialized) execution context. Prefer calling this from
+ * [PDF_RENDER_DISPATCHER] when you own the open/render/close sequence.
+ */
+internal fun renderOpenedPdfPageSafely(
+    renderer: PdfRenderer,
+    pageIndex: Int,
+    targetWidth: Int,
+    targetHeight: Int,
+    zoomScale: Float,
+    maxBitmapPixels: Long,
+    maxBitmapDimension: Int,
+): Bitmap? {
+    if (pageIndex < 0 || pageIndex >= renderer.pageCount) return null
+    var page: PdfRenderer.Page? = null
+    return try {
+        page = renderer.openPage(pageIndex)
+        renderPageCrisp(
+            page = page,
+            targetWidth = targetWidth,
+            targetHeight = targetHeight,
+            zoomScale = zoomScale,
+            maxBitmapPixels = maxBitmapPixels,
+            maxBitmapDimension = maxBitmapDimension,
+        )
+    } catch (error: Throwable) {
+        Log.w(TAG, "Safe PDF page open/render failed for index $pageIndex.", error)
+        null
+    } finally {
+        try {
+            page?.close()
+        } catch (closeError: Throwable) {
+            Log.w(TAG, "Failed to close PDF page $pageIndex.", closeError)
+        }
     }
 }

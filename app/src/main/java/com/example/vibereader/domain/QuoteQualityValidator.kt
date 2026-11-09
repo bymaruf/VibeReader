@@ -1,5 +1,8 @@
 package com.example.vibereader.domain
 
+import com.example.vibereader.domain.model.EBookLocation
+import com.example.vibereader.domain.model.EBookQuote
+
 object QuoteQualityValidator {
     private val wordPattern = Regex("""[\p{L}\p{N}]+(?:['’’-][\p{L}\p{N}]+)*""")
     private val incompleteEnds = setOf(
@@ -27,6 +30,29 @@ object QuoteQualityValidator {
 
         return true
     }
+
+    /** Validates both the excerpt and its universal document location. */
+    fun isValidQuote(quote: EBookQuote): Boolean =
+        isValidQuote(quote.selectedText) && isValidLocation(quote.location)
+
+    /**
+     * Convenience overload for callers that persist the generic document
+     * parameters directly instead of building an [EBookQuote] first.
+     */
+    fun isValidQuote(
+        bookId: String,
+        chapterIndex: Int,
+        characterOffset: Int,
+        selectedText: String,
+    ): Boolean = isValidQuote(selectedText) && isValidLocation(
+        EBookLocation(
+            bookId = bookId,
+            chapterIndex = chapterIndex,
+            characterOffset = characterOffset,
+        ),
+    )
+
+    fun isValidLocation(location: EBookLocation): Boolean = location.isValid
 
     private const val MIN_LENGTH = 20
     private const val MIN_WORDS = 4
