@@ -81,11 +81,23 @@ data class AiCompletion(
 )
 
 /**
+ * A provider response that passed caller-supplied validation. [value] is the
+ * parsed result (for example, a list of usable quotes) produced by the
+ * validator that accepted this attempt.
+ */
+data class AiValidatedCompletion<T>(
+    val value: T,
+    val provider: AiProvider,
+    val model: String,
+)
+
+/**
  * Resolves every usable entry in the user's API-key/failover pool.
  *
- * The selected provider is always first. Every other enabled provider follows
- * in a stable order. Each provider's model is read dynamically from its own
- * DataStore key at resolution time, so a failover to Gemini uses
+ * The selected provider is always first. OpenRouter, OpenCode, Gemini and
+ * Anthropic (Claude) follow in that order, then any remaining enabled
+ * providers. Each provider's model is read dynamically from its own DataStore
+ * key at resolution time, so a failover to Gemini uses
  * `SELECTED_GEMINI_MODEL`, a failover to OpenCode uses
  * `SELECTED_OPENCODE_MODEL`, and so on.
  *
@@ -103,6 +115,21 @@ object AiRuntimeResolver {
 
     private const val TAG = "AiRuntimeResolver"
     private const val AI_ERROR_TAG = "VibeReader_AI"
+
+    /**
+     * Non-active provider order for every AI feature. The active provider is
+     * always tried first; if it fails, the sweep continues through OpenRouter,
+     * OpenCode, Gemini and Claude before the remaining providers.
+     */
+    private val FAILOVER_PRIORITY = listOf(
+        AiProvider.OPENROUTER,
+        AiProvider.OPENCODE,
+        AiProvider.GEMINI,
+        AiProvider.ANTHROPIC,
+        AiProvider.OPENAI,
+        AiProvider.GROQ,
+        AiProvider.DEEPSEEK,
+    )
 
     fun resolve(keyVault: AiKeyVault): List<ResolvedAiRequest> {
         val activeProvider = keyVault.getSelectedProvider()
@@ -146,9 +173,13 @@ object AiRuntimeResolver {
         }
 
         tryAdd(activeProvider, isActive = true)
-        AiProvider.entries
+        FAILOVER_PRIORITY
             .asSequence()
             .filter { it != activeProvider }
+            .forEach { provider -> tryAdd(provider, isActive = false) }
+        AiProvider.entries
+            .asSequence()
+            .filter { it != activeProvider && it !in FAILOVER_PRIORITY }
             .forEach { provider -> tryAdd(provider, isActive = false) }
 
         if (resolved.isEmpty()) {
@@ -231,9 +262,11 @@ object AiRuntimeResolver {
  * Every request resolves the full provider pool on each invocation, starts with
  * the selected provider, and immediately retries the next provider on HTTP
  * 401/403/404/429, any other HTTP failure, a network exception, a timeout, or
- * an unexpected runtime error. The model used for each attempt is the exact
- * model saved for that provider, so switching providers never reuses another
- * provider's model ID.
+ * an unexpected runtime error. [completeValidated] additionally treats a
+ * response that fails caller-side validation (for example, no usable quotes)
+ * as an attempt failure and advances to the next provider. The model used for
+ * each attempt is the exact model saved for that provider, so switching
+ * providers never reuses another provider's model ID.
  *
  * The UI only receives a failure after every key/provider in the pool has been
  * exhausted. A failed sweep is terminal: this manager throws one
@@ -265,7 +298,45 @@ object AiFailoverManager {
         temperature: Double,
         logTag: String = TAG,
         overallTimeoutMillis: Long = DEFAULT_OVERALL_TIMEOUT_MILLIS,
-    ): AiCompletion = withContext(Dispatchers.IO) {
+    ): AiCompletion {
+        val result = completeValidated(
+            keyVault = keyVault,
+            httpClient = httpClient,
+            systemPrompt = systemPrompt,
+            userContent = userContent,
+            maxTokens = maxTokens,
+            temperature = temperature,
+            logTag = logTag,
+            overallTimeoutMillis = overallTimeoutMillis,
+            validate = { text -> text },
+        )
+        return AiCompletion(
+            text = result.value,
+            provider = result.provider,
+            model = result.model,
+        )
+    }
+
+    /**
+     * Runs the same sequential provider/key sweep as [complete], but every
+     * response must pass [validate] before it is accepted. A parsing failure,
+     * empty result, or any other validation exception counts as an attempt
+     * failure, so the next provider/key in the sequence is tried immediately.
+     *
+     * This is what lets quote fetching fail over when a provider returns HTTP
+     * 200 with unusable text instead of stopping at the first provider.
+     */
+    suspend fun <T> completeValidated(
+        keyVault: AiKeyVault,
+        httpClient: OkHttpClient,
+        systemPrompt: String,
+        userContent: String,
+        maxTokens: Int?,
+        temperature: Double,
+        logTag: String = TAG,
+        overallTimeoutMillis: Long = DEFAULT_OVERALL_TIMEOUT_MILLIS,
+        validate: (String) -> T,
+    ): AiValidatedCompletion<T> = withContext(Dispatchers.IO) {
         val configs = try {
             AiRuntimeResolver.resolve(keyVault)
         } catch (cancelled: CancellationException) {
@@ -304,13 +375,35 @@ object AiFailoverManager {
                         temperature = temperature,
                         logTag = logTag,
                     )
+
+                    // Validation failures are attempt failures, not terminal
+                    // request failures. Advance to the next provider/key.
+                    val value = try {
+                        validate(text)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (validationError: Throwable) {
+                        lastError = validationError
+                        Log.e(AI_ERROR_TAG, "Execution error", validationError)
+                        Log.e(
+                            logTag,
+                            "AI response validation failed on " +
+                                "${config.provider.displayName} " +
+                                "(model=$usedModel) [${index + 1}/${attempts.size}]; " +
+                                "trying next provider.",
+                            validationError,
+                        )
+                        currentCoroutineContext().ensureActive()
+                        continue
+                    }
+
                     Log.d(
                         TAG,
                         "Provider ${config.provider.shortLabel} succeeded with " +
                             "model=$usedModel [${index + 1}/${attempts.size}].",
                     )
-                    return@withTimeoutOrNull AiCompletion(
-                        text = text,
+                    return@withTimeoutOrNull AiValidatedCompletion(
+                        value = value,
                         provider = config.provider,
                         model = usedModel,
                     )

@@ -24,6 +24,13 @@ data class AiQuoteFetchResult(
 )
 
 /**
+ * Internal attempt-level failure. A provider may return HTTP 200 with prose,
+ * an empty array, or malformed JSON; that must fail over to the next provider
+ * rather than surfacing immediately.
+ */
+private class AiQuoteValidationException(message: String) : Exception(message)
+
+/**
  * Fetches AI-curated quotes, parses the provider response, maps the result to
  * [QuoteEntity] rows, and inserts only genuinely new quotes into Room.
  *
@@ -36,9 +43,13 @@ data class AiQuoteFetchResult(
  *   fails immediately with [AiRuntimeResolver.SETUP_ERROR_MESSAGE].
  *
  * Failover:
- * - [AiFailoverManager] tries the selected provider first, then enabled saved
- *   providers/keys, retrying on HTTP 401/403/404/429, any HTTP/network/timeout
- *   error, or unexpected runtime error.
+ * - [AiFailoverManager] tries the selected provider first, then OpenRouter,
+ *   OpenCode, Gemini, Claude, and any remaining enabled providers/keys,
+ *   retrying on HTTP 401/403/404/429, any HTTP/network/timeout error, or
+ *   unexpected runtime error.
+ * - Parsing/validation failures are attempt failures too: an HTTP 200 response
+ *   with no usable quotes advances to the next provider instead of surfacing a
+ *   provider-specific error immediately.
  * - Each failover attempt uses the model saved for the provider being tried
  *   (re-resolved per request through the failover pool), never another
  *   provider's model ID.
@@ -169,7 +180,10 @@ class AiQuoteRepository(
                 "the book '$bookTitle'$authorHint. Return as a JSON array of strings. " +
                 "If fewer new quotes remain, return as many as you can find.$exclusion"
 
-        val completion = AiFailoverManager.complete(
+        // The validator runs inside the failover sweep. An HTTP 200 response
+        // that cannot be parsed into usable quotes is treated exactly like a
+        // request failure, so the next provider/key is tried immediately.
+        val completion = AiFailoverManager.completeValidated(
             keyVault = keyVault,
             httpClient = httpClient,
             systemPrompt = systemPrompt,
@@ -178,14 +192,44 @@ class AiQuoteRepository(
             temperature = 0.5,
             logTag = TAG,
             overallTimeoutMillis = REQUEST_TIMEOUT_MILLIS,
+            validate = { raw -> extractUsableQuotes(raw, count, bookId) },
         )
         Log.d(
             TAG,
-            "Received ${completion.text.length} chars from ${completion.provider.shortLabel} " +
-                "model=${completion.model}.",
+            "Received ${completion.value.size} usable quote(s) from " +
+                "${completion.provider.shortLabel} model=${completion.model}.",
         )
 
-        val parsed = AiQuoteResponseParser.parse(completion.text)
+        val inserted = persistQuotes(
+            bookId = bookId,
+            quotes = completion.value,
+            chapter = chapter,
+            onQuotePersisted = onQuotePersisted,
+        )
+        Log.d(
+            TAG,
+            "Kept ${completion.value.size} quote(s), inserted $inserted new " +
+                "AI quote(s) for book=$bookId.",
+        )
+        return AiQuoteFetchResult(
+            insertedCount = inserted,
+            provider = completion.provider,
+            model = completion.model,
+            quotes = completion.value,
+        )
+    }
+
+    /**
+     * Parses one provider response and throws when it contains no quote that
+     * passes validation. [AiFailoverManager.completeValidated] catches this as
+     * an attempt failure and advances to the next provider/key.
+     */
+    private fun extractUsableQuotes(
+        raw: String,
+        count: Int,
+        bookId: String,
+    ): List<String> {
+        val parsed = AiQuoteResponseParser.parse(raw)
         val quotes = parsed
             .map(::normalizeQuote)
             .filter(QuoteQualityValidator::isValidQuote)
@@ -202,36 +246,13 @@ class AiQuoteRepository(
             Log.e(
                 AI_ERROR_TAG,
                 "Execution error: AI response contained no usable quotes. " +
-                    "provider=${completion.provider.shortLabel}, " +
-                    "model=${completion.model}, " +
-                    "preview=${completion.text.take(PREVIEW_CHARS).replace('\n', ' ')}",
+                    "preview=${raw.take(PREVIEW_CHARS).replace('\n', ' ')}",
             )
-            throw AiRequestException(
-                message = "The AI returned no usable quotes. Try again or choose another " +
-                    "model in Settings → AI Providers.",
-                provider = completion.provider,
-                model = completion.model,
-                stopBackgroundFetch = true,
+            throw AiQuoteValidationException(
+                "The AI response contained no usable quotes.",
             )
         }
-
-        val inserted = persistQuotes(
-            bookId = bookId,
-            quotes = quotes,
-            chapter = chapter,
-            onQuotePersisted = onQuotePersisted,
-        )
-        Log.d(
-            TAG,
-            "Parsed ${parsed.size} candidates, kept ${quotes.size}, inserted $inserted new " +
-                "AI quote(s) for book=$bookId.",
-        )
-        return AiQuoteFetchResult(
-            insertedCount = inserted,
-            provider = completion.provider,
-            model = completion.model,
-            quotes = quotes,
-        )
+        return quotes
     }
 
     /**
