@@ -1,7 +1,30 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
+}
+
+// Read build-time AI credentials from the git-ignored local.properties file.
+// Missing values or the placeholder text become empty BuildConfig constants, so
+// user-saved keys in Settings continue to work without any hardcoded fallback.
+val localProperties = Properties().apply {
+    val propertiesFile = rootProject.file("local.properties")
+    if (propertiesFile.isFile) {
+        propertiesFile.inputStream().use { load(it) }
+    }
+}
+
+fun localBuildConfigString(name: String): String {
+    val value = localProperties.getProperty(name)
+        ?.trim()
+        ?.takeUnless { it.isEmpty() || it == "your_key_here" }
+        .orEmpty()
+    val escaped = value
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+    return "\"$escaped\""
 }
 
 android {
@@ -16,6 +39,42 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+
+        buildConfigField(
+            "String",
+            "OPENROUTER_API_KEY",
+            localBuildConfigString("OPENROUTER_API_KEY"),
+        )
+        buildConfigField(
+            "String",
+            "OPENCODE_API_KEY",
+            localBuildConfigString("OPENCODE_API_KEY"),
+        )
+        buildConfigField(
+            "String",
+            "GEMINI_API_KEY",
+            localBuildConfigString("GEMINI_API_KEY"),
+        )
+        buildConfigField(
+            "String",
+            "CLAUDE_API_KEY",
+            localBuildConfigString("CLAUDE_API_KEY"),
+        )
+        buildConfigField(
+            "String",
+            "OPENAI_API_KEY",
+            localBuildConfigString("OPENAI_API_KEY"),
+        )
+        buildConfigField(
+            "String",
+            "GROQ_API_KEY",
+            localBuildConfigString("GROQ_API_KEY"),
+        )
+        buildConfigField(
+            "String",
+            "DEEPSEEK_API_KEY",
+            localBuildConfigString("DEEPSEEK_API_KEY"),
+        )
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -34,6 +93,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 

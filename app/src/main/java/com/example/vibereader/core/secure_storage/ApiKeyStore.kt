@@ -98,7 +98,7 @@ class ApiKeyStore(context: Context) {
     fun getApiKey(provider: AiProvider): String? {
         val savedKey = preferences.getString(providerKey(provider), null)
         if (!savedKey.isNullOrBlank()) return savedKey
-        return when (provider) {
+        val legacyKey = when (provider) {
             AiProvider.OPENROUTER -> getApiKey(ApiProvider.OPENROUTER)
             AiProvider.OPENAI -> getApiKey(ApiProvider.OPENAI)
             AiProvider.ANTHROPIC -> getApiKey(ApiProvider.CLAUDE)
@@ -108,6 +108,8 @@ class ApiKeyStore(context: Context) {
             AiProvider.DEEPSEEK,
             -> null
         }
+        return legacyKey?.takeIf(String::isNotBlank)
+            ?: BuildConfigApiKeys.forProvider(provider)
     }
 
     fun isConfigured(provider: AiProvider): Boolean =
@@ -148,7 +150,7 @@ class ApiKeyStore(context: Context) {
     }
 
     fun getApiKey(): String? =
-        getApiKey(ApiProvider.OPENROUTER) ?: preferences.getString(API_KEY, null)
+        getApiKey(AiProvider.OPENROUTER) ?: preferences.getString(API_KEY, null)
 
     fun clearApiKey() {
         clearApiKey(ApiProvider.OPENROUTER)

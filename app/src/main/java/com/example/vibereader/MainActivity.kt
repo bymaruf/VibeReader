@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarDefaults
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -37,6 +38,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
@@ -57,6 +59,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Draw the Compose hierarchy behind the status/navigation bars. The
+        // bottom navigation bar consumes its own navigation-bar inset, so the
+        // Scaffold must not add a second one.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Let the app's NavigationBar color show through on 3-button
+            // navigation instead of the platform's translucent white scrim.
+            @Suppress("DEPRECATION")
+            window.isNavigationBarContrastEnforced = false
+        }
         setContent {
             VibeReaderRoot()
         }
@@ -169,6 +181,23 @@ private fun VibeReaderApp(
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = backStackEntry?.destination
     val isReader = currentDestination?.route?.startsWith("reader/") == true
+    val context = LocalContext.current
+    val view = LocalView.current
+    val window = remember(context) { (context as? Activity)?.window }
+
+    // ReaderScreen switches the window to decor-fitting while it owns the
+    // screen. Restore edge-to-edge as soon as the reader leaves, otherwise the
+    // NavigationBar is laid out above the system navigation area and leaves a
+    // blank strip below it.
+    LaunchedEffect(isReader) {
+        val activityWindow = window ?: return@LaunchedEffect
+        if (!isReader) {
+            WindowCompat.setDecorFitsSystemWindows(activityWindow, false)
+            WindowCompat.getInsetsController(activityWindow, view).show(
+                WindowInsetsCompat.Type.systemBars(),
+            )
+        }
+    }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -177,6 +206,9 @@ private fun VibeReaderApp(
                 NavigationBar(
                     containerColor = MaterialTheme.colorScheme.surface,
                     contentColor = MaterialTheme.colorScheme.onSurface,
+                    // The bar paints its container color behind the system
+                    // navigation buttons, then pads its content by this inset.
+                    windowInsets = NavigationBarDefaults.windowInsets,
                 ) {
                     destinations.forEach { destination ->
                         val selected = currentDestination?.hierarchy?.any {

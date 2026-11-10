@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -53,6 +54,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
@@ -102,6 +105,8 @@ fun LibraryScreen(
     val scannedBooks = remember(books) { books.filter { it.isDeviceScanned } }
     val haptic = LocalHapticFeedback.current
     var gridLayout by remember { mutableStateOf(true) }
+    var isSearchActive by remember { mutableStateOf(false) }
+    val searchFocusRequester = remember { FocusRequester() }
 
     LaunchedEffect(scanEnabled) {
         if (scanEnabled) libraryViewModel.scanDeviceForBooks()
@@ -114,17 +119,74 @@ fun LibraryScreen(
             .padding(horizontal = 20.dp, vertical = 20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(
-                "LIBRARY",
-                style = MaterialTheme.typography.headlineSmall,
-                color = MaterialTheme.colorScheme.onBackground,
-            )
-            Text(
-                "Your books, ready when you are.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+        Crossfade(
+            targetState = isSearchActive,
+            modifier = Modifier.fillMaxWidth(),
+            label = "library-search-header",
+        ) { active ->
+            if (active) {
+                LaunchedEffect(Unit) {
+                    searchFocusRequester.requestFocus()
+                }
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = libraryViewModel::setSearchQuery,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(searchFocusRequester),
+                    placeholder = { Text("Search title or author...") },
+                    leadingIcon = {
+                        IconButton(
+                            onClick = {
+                                libraryViewModel.setSearchQuery("")
+                                isSearchActive = false
+                            },
+                        ) {
+                            Icon(
+                                imageVector = LibraryIcons.ArrowBack,
+                                contentDescription = "Close search",
+                            )
+                        }
+                    },
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { libraryViewModel.setSearchQuery("") }) {
+                                Icon(
+                                    imageVector = LibraryIcons.Clear,
+                                    contentDescription = "Clear search",
+                                )
+                            }
+                        }
+                    },
+                    shape = RoundedCornerShape(24.dp),
+                    singleLine = true,
+                )
+            } else {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            "LIBRARY",
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = MaterialTheme.colorScheme.onBackground,
+                        )
+                        Text(
+                            "Your books, ready when you are.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    IconButton(onClick = { isSearchActive = true }) {
+                        Icon(
+                            imageVector = LibraryIcons.Search,
+                            contentDescription = "Search",
+                        )
+                    }
+                }
+            }
         }
         scanState.errorMessage?.let { message ->
             Text(message, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
@@ -154,31 +216,6 @@ fun LibraryScreen(
                 }
             }
         }
-
-        OutlinedTextField(
-            value = searchQuery,
-            onValueChange = libraryViewModel::setSearchQuery,
-            modifier = Modifier.fillMaxWidth(),
-            placeholder = { Text("Search title or author...") },
-            leadingIcon = {
-                Icon(
-                    imageVector = LibraryIcons.Search,
-                    contentDescription = null,
-                )
-            },
-            trailingIcon = {
-                if (searchQuery.isNotEmpty()) {
-                    IconButton(onClick = { libraryViewModel.setSearchQuery("") }) {
-                        Icon(
-                            imageVector = LibraryIcons.Clear,
-                            contentDescription = "Clear search",
-                        )
-                    }
-                }
-            },
-            shape = RoundedCornerShape(24.dp),
-            singleLine = true,
-        )
 
         if (scannedBooks.isNotEmpty()) {
             Row(
@@ -601,8 +638,8 @@ private fun ReadingProgressBar(progress: Float, modifier: Modifier = Modifier) {
 
 /**
  * Minimal local icon set for the library search field. The Material Icons
- * artifact is not part of this project's dependencies, so the two required
- * glyphs are defined here as plain [ImageVector]s.
+ * artifact is not part of this project's dependencies, so the required glyphs
+ * are defined here as plain [ImageVector]s.
  */
 private object LibraryIcons {
     val Search: ImageVector by lazy {
@@ -619,6 +656,22 @@ private object LibraryIcons {
                     "c1.61,0 3.09,-0.59 4.23,-1.57l0.27,0.28v0.79l5,4.99" +
                     "L20.49,19l-4.99,-5zM9.5,14C7.01,14 5,11.99 5,9.5" +
                     "S7.01,5 9.5,5 14,7.01 14,9.5 11.99,14 9.5,14z",
+            ).toNodes(),
+            fill = SolidColor(Color.Black),
+        ).build()
+    }
+
+    val ArrowBack: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "LibraryArrowBack",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f,
+            autoMirror = true,
+        ).addPath(
+            pathData = PathParser().parsePathString(
+                "M20,11H7.83l5.59,-5.59L12,4l-8,8 8,8 1.41,-1.41L7.83,13H20v-2z",
             ).toNodes(),
             fill = SolidColor(Color.Black),
         ).build()
