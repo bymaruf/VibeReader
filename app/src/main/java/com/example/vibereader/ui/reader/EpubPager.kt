@@ -10,35 +10,40 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 
+/**
+ * Horizontal, viewport-by-viewport pager for EPUB content.
+ *
+ * [pageCount] is the total number of calculated viewport pages (not chapters).
+ * Swiping left/right always transitions to the adjacent viewport page.
+ */
 @Composable
 fun EpubPager(
-    chapterCount: Int,
-    currentChapterIndex: Int,
-    onChapterChanged: (Int) -> Unit,
+    pageCount: Int,
+    currentPageIndex: Int,
+    onPageChanged: (Int) -> Unit,
     modifier: Modifier = Modifier,
-    content: @Composable (chapterIndex: Int) -> Unit,
+    content: @Composable (pageIndex: Int) -> Unit,
 ) {
-    if (chapterCount <= 0) return
+    if (pageCount <= 0) return
 
     val pagerState = rememberPagerState(
-        initialPage = currentChapterIndex.coerceIn(0, chapterCount - 1),
-        pageCount = { chapterCount },
+        initialPage = currentPageIndex.coerceIn(0, pageCount - 1),
+        pageCount = { pageCount },
     )
 
-    LaunchedEffect(currentChapterIndex, chapterCount) {
-        val targetChapter = currentChapterIndex.coerceIn(0, chapterCount - 1)
-        if (pagerState.currentPage != targetChapter) {
-            pagerState.animateScrollToPage(targetChapter)
+    LaunchedEffect(currentPageIndex, pageCount) {
+        val targetPage = currentPageIndex.coerceIn(0, pageCount - 1)
+        if (pagerState.currentPage != targetPage) {
+            pagerState.scrollToPage(targetPage)
         }
     }
 
-    LaunchedEffect(pagerState, chapterCount) {
+    LaunchedEffect(pagerState, pageCount) {
         snapshotFlow { pagerState.currentPage }
             .distinctUntilChanged()
-            .collect(onChapterChanged)
+            .collect(onPageChanged)
     }
 
     HorizontalPager(

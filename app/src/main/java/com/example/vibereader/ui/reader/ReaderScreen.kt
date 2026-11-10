@@ -18,10 +18,13 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
@@ -179,6 +182,7 @@ fun ReaderScreen(
     var chromeVisible by rememberSaveable { mutableStateOf(true) }
     var pdfJumpRequest by remember(bookId) { mutableIntStateOf(-1) }
     var currentEpubChapter by remember(bookId) { mutableIntStateOf(0) }
+    var currentEpubPageIndex by remember(bookId) { mutableIntStateOf(0) }
     var speechTarget by remember(bookId) { mutableStateOf<SpeechTarget?>(null) }
     var epubSelectionVersion by remember(bookId) { mutableIntStateOf(0) }
 
@@ -189,6 +193,13 @@ fun ReaderScreen(
     val readerForeground = resolvedTheme.text
 
     val chapterListState = rememberLazyListState()
+
+    LaunchedEffect(state.initialEpubChapter, state.initialEpubScrollOffset, state.book?.id) {
+        if (state.book != null && !state.book!!.format.equals("PDF", ignoreCase = true)) {
+            currentEpubChapter = state.initialEpubChapter.coerceAtLeast(0)
+            currentEpubPageIndex = state.initialEpubScrollOffset.coerceAtLeast(0)
+        }
+    }
 
     val startSpeech: (String, SpeechTarget) -> Unit = { text, target ->
         speechTarget = target
@@ -323,12 +334,19 @@ fun ReaderScreen(
 
     val title = state.book?.displayTitle().orEmpty().ifBlank { "Reader" }
     val isPdf = state.book?.format.equals("PDF", ignoreCase = true)
-    val currentPageLabel = if (isPdf) {
-        "${state.pdfPageIndex + 1} / ${state.pdfPageCount.coerceAtLeast(1)}"
-    } else {
-        val idx = currentEpubChapter.coerceIn(0, (state.chapters.size - 1).coerceAtLeast(0))
-        val ch = state.chapters.getOrNull(idx)
-        ch?.title?.ifBlank { "Chapter ${idx + 1}" } ?: "Chapter"
+    val isHorizontalEpub = !isPdf && state.settings.scrollMode == ScrollMode.HORIZONTAL
+    var epubTotalPages by remember(bookId, isHorizontalEpub) { mutableIntStateOf(0) }
+    var epubVerticalProgress by remember(bookId, isHorizontalEpub) { mutableStateOf(0f) }
+    val currentPageLabel = when {
+        isPdf -> "${state.pdfPageIndex + 1} / ${state.pdfPageCount.coerceAtLeast(1)}"
+        isHorizontalEpub && epubTotalPages > 0 ->
+            "${currentEpubPageIndex + 1} / $epubTotalPages"
+        !isPdf && !isHorizontalEpub -> "${(epubVerticalProgress * 100).toInt().coerceIn(0, 100)}%"
+        else -> {
+            val idx = currentEpubChapter.coerceIn(0, (state.chapters.size - 1).coerceAtLeast(0))
+            val ch = state.chapters.getOrNull(idx)
+            ch?.title?.ifBlank { "Chapter ${idx + 1}" } ?: "Chapter"
+        }
     }
 
     val pdfFile = remember(state.book?.filePath) {
@@ -374,8 +392,13 @@ fun ReaderScreen(
                 ReaderBottomBar(
                     currentPageLabel = currentPageLabel,
                     isPdf = isPdf,
-                    currentPage = state.pdfPageIndex,
-                    totalPages = state.pdfPageCount,
+                    pdfCurrentPage = state.pdfPageIndex,
+                    pdfTotalPages = state.pdfPageCount,
+                    isHorizontalEpub = isHorizontalEpub,
+                    epubCurrentPage = currentEpubPageIndex,
+                    epubTotalPages = epubTotalPages,
+                    verticalProgress = epubVerticalProgress,
+                    showVerticalProgress = !isPdf && !isHorizontalEpub && state.chapters.isNotEmpty(),
                     chapterCount = state.chapters.size,
                     currentChapter = currentEpubChapter,
                     foreground = readerForeground,
@@ -384,6 +407,8 @@ fun ReaderScreen(
                         pdfJumpRequest = page
                         viewModel.setPdfPageIndex(page)
                     },
+                    onEpubPageChange = { page -> currentEpubPageIndex = page },
+                    onVerticalProgressChange = { epubVerticalProgress = it },
                     onChapterChange = { chapter ->
                         currentEpubChapter = chapter
                         coroutineScope.launch {
@@ -466,41 +491,86 @@ fun ReaderScreen(
                 }
 
                 else -> {
-                    EpubReaderCanvas(
-                        chapters = state.chapters,
-                        listState = chapterListState,
-                        settings = state.settings,
-                        currentChapterIndex = currentEpubChapter,
-                        foreground = readerForeground,
-                        background = readerBackground,
-                        speechHighlightStart = if (!state.speechHighlight?.text.isNullOrEmpty() &&
-                            !isPdf && speechTarget?.chapterIndex == currentEpubChapter
-                        ) {
-                            speechTarget?.sourceOffset?.plus(activeSpeechProgress.startCharIndex)
-                        } else {
-                            null
-                        },
-                        speechHighlightEnd = if (!state.speechHighlight?.text.isNullOrEmpty() &&
-                            !isPdf && speechTarget?.chapterIndex == currentEpubChapter
-                        ) {
-                            speechTarget?.sourceOffset?.plus(activeSpeechProgress.endCharIndex)
-                        } else {
-                            null
-                        },
-                        selection = state.selection,
-                        onCanvasTap = { chromeVisible = !chromeVisible },
-                        onChapterChanged = { index ->
-                            currentEpubChapter = index
-                            viewModel.updateEpubProgress(
-                                chapterIndex = index,
-                                scrollOffsetPx = 0,
-                                progress = if (state.chapters.isEmpty()) 0f
-                                else (index + 1).toFloat() / state.chapters.size.toFloat(),
+                    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                        val epubPages = if (isHorizontalEpub) {
+                            rememberEpubPages(
+                                chapters = state.chapters,
+                                viewportWidthDp = maxWidth,
+                                viewportHeightDp = maxHeight,
+                                fontSize = state.settings.fontSizeSp.sp,
+                                lineHeight = (state.settings.fontSizeSp * state.settings.lineHeightMultiplier).sp,
+                                marginDp = state.settings.marginDp,
                             )
-                        },
-                        onSelectionChanged = viewModel::setSelection,
-                        selectionVersion = epubSelectionVersion,
-                    )
+                        } else {
+                            emptyList()
+                        }
+                        LaunchedEffect(epubPages.size) {
+                            epubTotalPages = epubPages.size
+                            if (epubPages.isNotEmpty()) {
+                                val restored = state.initialEpubScrollOffset.coerceIn(0, epubPages.lastIndex)
+                                // Prefer restoring by saved page index; fall back to saved chapter.
+                                val target = if (state.initialEpubScrollOffset >= 0) restored else {
+                                    epubPages.indexOfFirst { it.chapterIndex == state.initialEpubChapter }
+                                        .takeIf { it >= 0 } ?: 0
+                                }
+                                if (currentEpubPageIndex > epubPages.lastIndex) currentEpubPageIndex = epubPages.lastIndex
+                                if (currentEpubPageIndex == 0 && target > 0) currentEpubPageIndex = target
+                            }
+                        }
+                        EpubReaderCanvas(
+                            chapters = state.chapters,
+                            epubPages = epubPages,
+                            listState = chapterListState,
+                            settings = state.settings,
+                            currentChapterIndex = currentEpubChapter,
+                            currentEpubPageIndex = currentEpubPageIndex,
+                            foreground = readerForeground,
+                            background = readerBackground,
+                            speechHighlightStart = if (!state.speechHighlight?.text.isNullOrEmpty() &&
+                                speechTarget?.chapterIndex == currentEpubChapter
+                            ) {
+                                speechTarget?.sourceOffset?.plus(activeSpeechProgress.startCharIndex)
+                            } else null,
+                            speechHighlightEnd = if (!state.speechHighlight?.text.isNullOrEmpty() &&
+                                speechTarget?.chapterIndex == currentEpubChapter
+                            ) {
+                                speechTarget?.sourceOffset?.plus(activeSpeechProgress.endCharIndex)
+                            } else null,
+                            selection = state.selection,
+                            onCanvasTap = { chromeVisible = !chromeVisible },
+                            onChapterChanged = { index ->
+                                currentEpubChapter = index
+                                viewModel.updateEpubProgress(
+                                    chapterIndex = index,
+                                    scrollOffsetPx = 0,
+                                    progress = if (state.chapters.isEmpty()) 0f
+                                    else (index + 1).toFloat() / state.chapters.size.toFloat(),
+                                )
+                            },
+                            onVerticalScrollProgressChanged = { progress ->
+                                epubVerticalProgress = progress
+                                viewModel.updateEpubProgress(
+                                    chapterIndex = currentEpubChapter,
+                                    scrollOffsetPx = 0,
+                                    progress = progress,
+                                )
+                            },
+                            onEpubPageChanged = { pageIndex, chapterIndex, totalPages ->
+                                currentEpubPageIndex = pageIndex
+                                currentEpubChapter = chapterIndex
+                                val progress = if (totalPages > 0) {
+                                    (pageIndex + 1).toFloat() / totalPages.toFloat()
+                                } else 0f
+                                viewModel.updateEpubProgress(
+                                    chapterIndex = chapterIndex,
+                                    scrollOffsetPx = pageIndex,
+                                    progress = progress,
+                                )
+                            },
+                            onSelectionChanged = viewModel::setSelection,
+                            selectionVersion = epubSelectionVersion,
+                        )
+                    }
                 }
             }
 
@@ -669,13 +739,20 @@ private fun ReaderTopBar(
 private fun ReaderBottomBar(
     currentPageLabel: String,
     isPdf: Boolean,
-    currentPage: Int,
-    totalPages: Int,
+    pdfCurrentPage: Int,
+    pdfTotalPages: Int,
+    isHorizontalEpub: Boolean,
+    epubCurrentPage: Int,
+    epubTotalPages: Int,
+    verticalProgress: Float,
+    showVerticalProgress: Boolean,
     chapterCount: Int,
     currentChapter: Int,
     foreground: Color,
     background: Color,
     onPdfPageChange: (Int) -> Unit,
+    onEpubPageChange: (Int) -> Unit,
+    onVerticalProgressChange: (Float) -> Unit,
     onChapterChange: (Int) -> Unit,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
@@ -691,24 +768,26 @@ private fun ReaderBottomBar(
         disabledActiveTrackColor = foreground.copy(alpha = 0.18f),
         disabledInactiveTrackColor = foreground.copy(alpha = 0.07f),
     )
-    val showPdfProgress = isPdf && totalPages > 1
-    val showChapterProgress = !isPdf && chapterCount > 1
-    val showSlider = showPdfProgress || showChapterProgress
+    val showPdfProgress = isPdf && pdfTotalPages > 1
+    val showEpubPageProgress = !isPdf && isHorizontalEpub && epubTotalPages > 1
+    val showSlider = showPdfProgress || showEpubPageProgress || showVerticalProgress
     val maxValue = when {
-        showPdfProgress -> (totalPages - 1).coerceAtLeast(1).toFloat()
-        showChapterProgress -> (chapterCount - 1).coerceAtLeast(1).toFloat()
+        showPdfProgress -> (pdfTotalPages - 1).coerceAtLeast(1).toFloat()
+        showEpubPageProgress -> (epubTotalPages - 1).coerceAtLeast(1).toFloat()
+        showVerticalProgress -> 1f
         else -> 0f
     }
     val currentValue = when {
-        showPdfProgress -> currentPage.toFloat()
-            .coerceIn(0f, (totalPages - 1).coerceAtLeast(0).toFloat())
-        showChapterProgress -> currentChapter.toFloat()
-            .coerceIn(0f, (chapterCount - 1).coerceAtLeast(0).toFloat())
+        showPdfProgress -> pdfCurrentPage.toFloat()
+            .coerceIn(0f, (pdfTotalPages - 1).coerceAtLeast(0).toFloat())
+        showEpubPageProgress -> epubCurrentPage.toFloat()
+            .coerceIn(0f, (epubTotalPages - 1).coerceAtLeast(0).toFloat())
+        showVerticalProgress -> verticalProgress.coerceIn(0f, 1f)
         else -> 0f
     }
     val stepCount = when {
-        showPdfProgress -> (totalPages - 2).coerceAtLeast(0)
-        showChapterProgress -> (chapterCount - 2).coerceAtLeast(0)
+        showPdfProgress -> (pdfTotalPages - 2).coerceAtLeast(0)
+        showEpubPageProgress -> (epubTotalPages - 2).coerceAtLeast(0)
         else -> 0
     }
 
@@ -732,11 +811,10 @@ private fun ReaderBottomBar(
             Slider(
                 value = currentValue,
                 onValueChange = { value ->
-                    val selected = value.roundToInt()
-                    if (showPdfProgress) {
-                        onPdfPageChange(selected)
-                    } else {
-                        onChapterChange(selected)
+                    when {
+                        showPdfProgress -> onPdfPageChange(value.roundToInt())
+                        showEpubPageProgress -> onEpubPageChange(value.roundToInt())
+                        showVerticalProgress -> onVerticalProgressChange(value.coerceIn(0f, 1f))
                     }
                 },
                 modifier = Modifier
@@ -757,7 +835,7 @@ private fun ReaderBottomBar(
                 },
                 track = { sliderState ->
                     ReadingProgressTrack(
-                        fraction = sliderState.coercedValueAsFraction,
+                        fraction = if (showVerticalProgress) currentValue else sliderState.coercedValueAsFraction,
                         activeColor = activeTrackColor,
                         inactiveColor = inactiveTrackColor,
                     )
@@ -804,9 +882,11 @@ private fun ReadingProgressTrack(
 @Composable
 private fun EpubReaderCanvas(
     chapters: List<BookChapterEntity>,
+    epubPages: List<EpubPage>,
     listState: LazyListState,
     settings: ReaderSettings,
     currentChapterIndex: Int,
+    currentEpubPageIndex: Int,
     foreground: Color,
     background: Color,
     speechHighlightStart: Int?,
@@ -814,6 +894,8 @@ private fun EpubReaderCanvas(
     selection: ReaderSelection?,
     onCanvasTap: () -> Unit,
     onChapterChanged: (Int) -> Unit,
+    onVerticalScrollProgressChanged: (Float) -> Unit,
+    onEpubPageChanged: (pageIndex: Int, chapterIndex: Int, totalPages: Int) -> Unit,
     onSelectionChanged: (ReaderSelection?) -> Unit,
     selectionVersion: Int,
 ) {
@@ -834,17 +916,35 @@ private fun EpubReaderCanvas(
     }
 
     if (settings.scrollMode == ScrollMode.HORIZONTAL) {
+        if (epubPages.isEmpty()) return
+        val safePageIndex = currentEpubPageIndex.coerceIn(0, epubPages.lastIndex)
+        // If external chapter navigation occurred (e.g. programmatic), jump to that chapter's first page.
+        LaunchedEffect(currentChapterIndex, epubPages) {
+            val currentPage = epubPages.getOrNull(currentEpubPageIndex)
+            if (currentPage != null && currentPage.chapterIndex != currentChapterIndex) {
+                val target = epubPages.indexOfFirst { it.chapterIndex == currentChapterIndex }
+                    .takeIf { it >= 0 } ?: 0
+                if (target != currentEpubPageIndex) {
+                    onEpubPageChanged(target, currentChapterIndex, epubPages.size)
+                }
+            }
+        }
         EpubPager(
-            chapterCount = chapters.size,
-            currentChapterIndex = currentChapterIndex,
-            onChapterChanged = onChapterChanged,
+            pageCount = epubPages.size,
+            currentPageIndex = safePageIndex,
+            onPageChanged = { pageIndex ->
+                val page = epubPages.getOrNull(pageIndex) ?: return@EpubPager
+                onEpubPageChanged(pageIndex, page.chapterIndex, epubPages.size)
+            },
             modifier = Modifier
                 .fillMaxSize()
                 .background(background),
-        ) { chapterIndex ->
+        ) { pageIndex ->
+            val page = epubPages[pageIndex]
+            val chapter = chapters.getOrNull(page.chapterIndex) ?: return@EpubPager
             EpubChapterRenderer(
-                chapter = chapters[chapterIndex],
-                chapterIndex = chapterIndex,
+                chapter = chapter,
+                chapterIndex = page.chapterIndex,
                 fontSize = fontSize,
                 lineHeight = lineHeight,
                 marginDp = settings.marginDp,
@@ -852,32 +952,48 @@ private fun EpubReaderCanvas(
                 background = background,
                 selectionVersion = selectionVersion,
                 highlightStartOffset = speechHighlightStart
-                    .takeIf { chapterIndex == currentChapterIndex },
+                    ?.takeIf { page.chapterIndex == currentChapterIndex },
                 highlightEndOffset = speechHighlightEnd
-                    .takeIf { chapterIndex == currentChapterIndex },
+                    ?.takeIf { page.chapterIndex == currentChapterIndex },
                 selection = selection,
                 onCanvasTap = onCanvasTap,
                 onSelectionChanged = onSelectionChanged,
+                pageText = page.text,
+                pageStartOffset = page.chapterStartOffset,
+                showTitle = page.isChapterStart,
+                scrollEnabled = false,
             )
         }
         return
     }
 
-    LazyColumn(
-        state = listState,
+    val verticalScrollState = rememberScrollState()
+    // Real-time vertical progress: currentScrollPosition / (totalScrollHeight - viewportHeight)
+    LaunchedEffect(
+        verticalScrollState.value,
+        verticalScrollState.maxValue,
+    ) {
+        val max = verticalScrollState.maxValue
+        val progress = if (max > 0) {
+            (verticalScrollState.value.toFloat() / max.toFloat()).coerceIn(0f, 1f)
+        } else {
+            1f
+        }
+        onVerticalScrollProgressChanged(progress)
+    }
+
+    Column(
         modifier = Modifier
             .fillMaxSize()
             .background(background)
             .pointerInput(Unit) {
                 detectTapGestures(onTap = { onCanvasTap() })
-            },
-        contentPadding = PaddingValues(
-            horizontal = settings.marginDp.dp,
-            vertical = 24.dp,
-        ),
+            }
+            .verticalScroll(verticalScrollState)
+            .padding(horizontal = settings.marginDp.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        itemsIndexed(chapters, key = { index, chapter -> "${chapter.bookId}:$index" }) { index, chapter ->
+        chapters.forEachIndexed { index, chapter ->
             Text(
                 text = chapter.title,
                 modifier = Modifier.padding(top = if (index == 0) 0.dp else 24.dp),
@@ -900,9 +1016,9 @@ private fun EpubReaderCanvas(
                     foreground = foreground,
                     selectionVersion = selectionVersion,
                     highlightStartOffset = speechHighlightStart
-                        .takeIf { index == currentChapterIndex },
+                        ?.takeIf { index == currentChapterIndex },
                     highlightEndOffset = speechHighlightEnd
-                        .takeIf { index == currentChapterIndex },
+                        ?.takeIf { index == currentChapterIndex },
                     selection = selection,
                     onSelectionChanged = onSelectionChanged,
                 )

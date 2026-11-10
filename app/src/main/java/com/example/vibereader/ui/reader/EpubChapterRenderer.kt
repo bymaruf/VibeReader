@@ -45,25 +45,40 @@ fun EpubChapterRenderer(
     onCanvasTap: () -> Unit,
     onSelectionChanged: (ReaderSelection?) -> Unit,
     modifier: Modifier = Modifier,
+    /** When non-null, render only this viewport slice (horizontal pagination mode). */
+    pageText: String? = null,
+    /** Chapter-relative start offset of [pageText]; required when [pageText] is set. */
+    pageStartOffset: Int = 0,
+    /** Show the chapter title (typically only on the first page of a chapter). */
+    showTitle: Boolean = true,
+    /** Enable vertical scrolling inside the page. Disabled for horizontal viewport pages. */
+    scrollEnabled: Boolean = true,
 ) {
     val scrollState = rememberScrollState()
+    val displayText = pageText ?: chapter.text
+    val baseOffset = if (pageText != null) pageStartOffset.coerceAtLeast(0) else 0
+    val pageHighlightStart = highlightStartOffset?.let { it - baseOffset }
+    val pageHighlightEnd = highlightEndOffset?.let { it - baseOffset }
+
     Column(
         modifier = modifier
             .fillMaxSize()
             .background(background)
-            .pointerInput(chapter.bookId, chapterIndex) {
+            .pointerInput(chapter.bookId, chapterIndex, pageStartOffset) {
                 detectTapGestures(onTap = { onCanvasTap() })
             }
-            .verticalScroll(scrollState)
+            .then(if (scrollEnabled) Modifier.verticalScroll(scrollState) else Modifier)
             .padding(horizontal = marginDp.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text(
-            text = chapter.title,
-            color = foreground,
-            style = MaterialTheme.typography.titleLarge,
-        )
-        if (chapter.text.isBlank()) {
+        if (showTitle) {
+            Text(
+                text = chapter.title,
+                color = foreground,
+                style = MaterialTheme.typography.titleLarge,
+            )
+        }
+        if (displayText.isBlank()) {
             Text(
                 text = "Empty Chapter",
                 color = foreground,
@@ -74,12 +89,14 @@ fun EpubChapterRenderer(
             EpubSelectableText(
                 chapter = chapter,
                 chapterIndex = chapterIndex,
+                displayText = displayText,
+                chapterOffsetBase = baseOffset,
                 fontSize = fontSize,
                 lineHeight = lineHeight,
                 foreground = foreground,
                 selectionVersion = selectionVersion,
-                highlightStartOffset = highlightStartOffset,
-                highlightEndOffset = highlightEndOffset,
+                highlightStartOffset = pageHighlightStart,
+                highlightEndOffset = pageHighlightEnd,
                 selection = selection,
                 onSelectionChanged = onSelectionChanged,
             )
@@ -99,9 +116,13 @@ fun EpubSelectableText(
     highlightEndOffset: Int? = null,
     selection: ReaderSelection? = null,
     onSelectionChanged: (ReaderSelection?) -> Unit,
+    /** Text rendered in this view; may be a viewport slice in horizontal mode. */
+    displayText: String = chapter.text,
+    /** Chapter-relative offset added to local selection indices to form [ReaderSelection] offsets. */
+    chapterOffsetBase: Int = 0,
 ) {
-    var value by remember(chapter.bookId, chapterIndex) {
-        mutableStateOf(TextFieldValue(chapter.text))
+    var value by remember(chapter.bookId, chapterIndex, chapterOffsetBase, displayText) {
+        mutableStateOf(TextFieldValue(displayText))
     }
     LaunchedEffect(selectionVersion) {
         value = value.copy(selection = TextRange.Zero)
@@ -110,15 +131,21 @@ fun EpubSelectableText(
         highlightStartOffset != null && highlightEndOffset != null &&
             highlightEndOffset > highlightStartOffset -> {
             TextRange(
-                highlightStartOffset.coerceIn(0, chapter.text.length),
-                highlightEndOffset.coerceIn(0, chapter.text.length),
+                highlightStartOffset.coerceIn(0, displayText.length),
+                highlightEndOffset.coerceIn(0, displayText.length),
             )
         }
         selection?.chapterIndex == chapterIndex && selection.endOffset > selection.startOffset -> {
-            TextRange(
-                selection.startOffset.coerceIn(0, chapter.text.length),
-                selection.endOffset.coerceIn(0, chapter.text.length),
-            )
+            val localStart = selection.startOffset - chapterOffsetBase
+            val localEnd = selection.endOffset - chapterOffsetBase
+            if (localEnd > 0 && localStart < displayText.length) {
+                TextRange(
+                    localStart.coerceIn(0, displayText.length),
+                    localEnd.coerceIn(0, displayText.length),
+                )
+            } else {
+                TextRange.Zero
+            }
         }
         else -> TextRange.Zero
     }
@@ -129,18 +156,18 @@ fun EpubSelectableText(
         value = value,
         onValueChange = { updated ->
             value = updated
-            val start = minOf(updated.selection.start, updated.selection.end)
+            val localStart = minOf(updated.selection.start, updated.selection.end)
                 .coerceIn(0, updated.text.length)
-            val end = maxOf(updated.selection.start, updated.selection.end)
+            val localEnd = maxOf(updated.selection.start, updated.selection.end)
                 .coerceIn(0, updated.text.length)
-            if (end > start) {
+            if (localEnd > localStart) {
                 onSelectionChanged(
                     ReaderSelection(
                         chapterIndex = chapterIndex,
                         chapterTitle = chapter.title,
-                        text = updated.text.substring(start, end),
-                        startOffset = start,
-                        endOffset = end,
+                        text = updated.text.substring(localStart, localEnd),
+                        startOffset = chapterOffsetBase + localStart,
+                        endOffset = chapterOffsetBase + localEnd,
                     ),
                 )
             } else {
