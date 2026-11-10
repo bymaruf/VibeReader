@@ -14,10 +14,16 @@ interface BookDao {
     @Upsert
     suspend fun upsert(books: List<BookEntity>)
 
-    @Query("SELECT * FROM books ORDER BY lastReadAt DESC, addedAt DESC")
+    @Query(
+        "SELECT * FROM books " +
+            "ORDER BY MAX(lastReadAt, addedAt) DESC, title COLLATE NOCASE ASC",
+    )
     fun observeAll(): Flow<List<BookEntity>>
 
-    @Query("SELECT * FROM books ORDER BY lastReadAt DESC, addedAt DESC")
+    @Query(
+        "SELECT * FROM books " +
+            "ORDER BY MAX(lastReadAt, addedAt) DESC, title COLLATE NOCASE ASC",
+    )
     fun getAllBooksSortedByRecent(): Flow<List<BookEntity>>
 
     @Query("UPDATE books SET lastReadAt = :timestamp WHERE id = :bookId")

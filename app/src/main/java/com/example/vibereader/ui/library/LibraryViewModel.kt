@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -45,16 +46,49 @@ class LibraryViewModel(
         LibraryScanState(hasFolderAccess = preferences.getString(TREE_URI_KEY, null) != null),
     )
     val scanState: StateFlow<LibraryScanState> = _scanState.asStateFlow()
-    val books: StateFlow<List<BookEntity>> = database.bookDao().getAllBooksSortedByRecent().stateIn(
+
+    private val _searchQuery = MutableStateFlow("")
+    val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
+
+    /**
+     * Full catalog used for cover extraction. Kept separate from [books] so a
+     * search term never prevents covers for other books from being prepared.
+     */
+    private val allBooks: StateFlow<List<BookEntity>> =
+        database.bookDao().getAllBooksSortedByRecent().stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = emptyList(),
+        )
+
+    /**
+     * In-memory search + Last Activity ordering. The database flow is only
+     * queried when the catalog changes; each keystroke filters this list
+     * locally, so typing never triggers a Room query.
+     */
+    val books: StateFlow<List<BookEntity>> = combine(allBooks, _searchQuery) { catalog, query ->
+        val term = query.trim()
+        catalog.asSequence()
+            .filter { book ->
+                term.isEmpty() ||
+                    book.title.contains(term, ignoreCase = true) ||
+                    book.author?.contains(term, ignoreCase = true) == true
+            }
+            .sortedByDescending { book ->
+                maxOf(book.lastReadAt, book.addedAt)
+            }
+            .toList()
+    }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),
         initialValue = emptyList(),
     )
+
     private val coverExtractionRequests = mutableSetOf<String>()
 
     init {
         viewModelScope.launch {
-            books.collect { catalog ->
+            allBooks.collect { catalog ->
                 catalog.forEach { book ->
                     val sourceFile = File(book.filePath).takeIf(File::isFile) ?: return@forEach
                     if (book.coverImagePath?.let(::File)?.isFile == true) return@forEach
@@ -67,6 +101,10 @@ class LibraryViewModel(
                 }
             }
         }
+    }
+
+    fun setSearchQuery(query: String) {
+        _searchQuery.value = query
     }
 
     fun saveFolderAccess(uri: Uri) {

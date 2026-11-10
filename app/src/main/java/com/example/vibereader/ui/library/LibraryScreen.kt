@@ -35,9 +35,11 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -51,8 +53,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.hapticfeedback.HapticFeedback
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
@@ -89,6 +95,7 @@ fun LibraryScreen(
         },
     )
     val books by libraryViewModel.books.collectAsStateWithLifecycle(initialValue = emptyList())
+    val searchQuery by libraryViewModel.searchQuery.collectAsStateWithLifecycle()
     val scanState by libraryViewModel.scanState.collectAsStateWithLifecycle()
     val progress by database.readingProgressDao().observeAll().collectAsState(initial = emptyList())
     val progressByBook = remember(progress) { progress.associateBy { it.bookId } }
@@ -148,6 +155,31 @@ fun LibraryScreen(
             }
         }
 
+        OutlinedTextField(
+            value = searchQuery,
+            onValueChange = libraryViewModel::setSearchQuery,
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = { Text("Search title or author...") },
+            leadingIcon = {
+                Icon(
+                    imageVector = LibraryIcons.Search,
+                    contentDescription = null,
+                )
+            },
+            trailingIcon = {
+                if (searchQuery.isNotEmpty()) {
+                    IconButton(onClick = { libraryViewModel.setSearchQuery("") }) {
+                        Icon(
+                            imageVector = LibraryIcons.Clear,
+                            contentDescription = "Clear search",
+                        )
+                    }
+                }
+            },
+            shape = RoundedCornerShape(24.dp),
+            singleLine = true,
+        )
+
         if (scannedBooks.isNotEmpty()) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -193,6 +225,7 @@ fun LibraryScreen(
         AnimatedContent(
             targetState = when {
                 scanState.isScanning || scanState.isProcessingMetadata -> "loading"
+                scannedBooks.isEmpty() && searchQuery.isNotBlank() -> "no_results"
                 scannedBooks.isEmpty() -> "empty"
                 else -> "books"
             },
@@ -209,6 +242,24 @@ fun LibraryScreen(
                     } else {
                         BookCollection(scannedBooks, progressByBook, onBookSelected, haptic, gridLayout, context)
                     }
+                }
+                "no_results" -> Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(top = 40.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        "NO MATCHES",
+                        style = MaterialTheme.typography.titleMedium,
+                        letterSpacing = 1.5.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        "No books match \"${searchQuery.trim()}\".",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
                 "empty" -> Column(
                     modifier = Modifier
@@ -546,4 +597,46 @@ private fun ReadingProgressBar(progress: Float, modifier: Modifier = Modifier) {
         color = MaterialTheme.colorScheme.onSurface,
         trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
     )
+}
+
+/**
+ * Minimal local icon set for the library search field. The Material Icons
+ * artifact is not part of this project's dependencies, so the two required
+ * glyphs are defined here as plain [ImageVector]s.
+ */
+private object LibraryIcons {
+    val Search: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "LibrarySearch",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f,
+        ).addPath(
+            pathData = PathParser().parsePathString(
+                "M15.5,14h-0.79l-0.28,-0.27C15.41,12.59 16,11.11 16,9.5 " +
+                    "16,5.91 13.09,3 9.5,3S3,5.91 3,9.5 5.91,16 9.5,16" +
+                    "c1.61,0 3.09,-0.59 4.23,-1.57l0.27,0.28v0.79l5,4.99" +
+                    "L20.49,19l-4.99,-5zM9.5,14C7.01,14 5,11.99 5,9.5" +
+                    "S7.01,5 9.5,5 14,7.01 14,9.5 11.99,14 9.5,14z",
+            ).toNodes(),
+            fill = SolidColor(Color.Black),
+        ).build()
+    }
+
+    val Clear: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "LibraryClear",
+            defaultWidth = 24.dp,
+            defaultHeight = 24.dp,
+            viewportWidth = 24f,
+            viewportHeight = 24f,
+        ).addPath(
+            pathData = PathParser().parsePathString(
+                "M19,6.41L17.59,5 12,10.59 6.41,5 5,6.41 10.59,12 " +
+                    "5,17.59 6.41,19 12,13.41 17.59,19 19,17.59 13.41,12z",
+            ).toNodes(),
+            fill = SolidColor(Color.Black),
+        ).build()
+    }
 }
