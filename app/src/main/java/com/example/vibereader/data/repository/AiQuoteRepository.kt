@@ -1,6 +1,7 @@
 package com.example.vibereader.data.repository
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import com.example.vibereader.core.database.VibeReaderDatabase
 import com.example.vibereader.data.local.AiKeyVault
@@ -60,6 +61,14 @@ class AiQuoteRepository(
     fun getActiveAiConfig(): ActiveAiConfig = AiRuntimeResolver.getActiveAiConfig(keyVault)
 
     /**
+     * One-shot stop signal for the endless quote-fetch loop. After a terminal
+     * failover failure the UI is allowed to show the error once; the next loop
+     * iteration is cancelled instead of starting another provider sweep.
+     */
+    @Volatile
+    private var stopNextFetchAtElapsed: Long = 0L
+
+    /**
      * Fetches one batch and persists it. Throws [AiConfigurationException] or
      * [AiRequestException] with a user-friendly message when setup or the
      * network request fails. Any unexpected [Throwable] is logged with the
@@ -79,6 +88,7 @@ class AiQuoteRepository(
         alreadyCollected: List<String> = emptyList(),
         onQuotePersisted: ((QuoteEntity) -> Unit)? = null,
     ): AiQuoteFetchResult = withContext(Dispatchers.IO) {
+        abortFetchLoopIfTerminal()
         try {
             fetchAndPersistQuotesInternal(
                 bookId = bookId,
@@ -93,8 +103,29 @@ class AiQuoteRepository(
             throw cancelled
         } catch (error: Throwable) {
             Log.e(AI_ERROR_TAG, "Execution error", error)
-            throw error.toQuoteFetchException()
+            val mapped = error.toQuoteFetchException()
+            if (mapped is AiRequestException && mapped.stopBackgroundFetch) {
+                // The caller has already received this failure. Arm a one-shot
+                // cancellation so its automatic loop cannot immediately start
+                // another full key sweep and spam the same Toast.
+                stopNextFetchAtElapsed = SystemClock.elapsedRealtime()
+            }
+            throw mapped
         }
+    }
+
+    /**
+     * Cancels exactly the next fetch attempt after a terminal failure. The
+     * signal expires quickly so a deliberate user restart is never blocked.
+     */
+    private fun abortFetchLoopIfTerminal() {
+        val armedAt = stopNextFetchAtElapsed
+        if (armedAt == 0L) return
+        stopNextFetchAtElapsed = 0L
+        if (SystemClock.elapsedRealtime() - armedAt > TERMINAL_STOP_WINDOW_MILLIS) return
+        throw CancellationException(
+            "AI quote fetching stopped after all API keys failed.",
+        )
     }
 
     private suspend fun fetchAndPersistQuotesInternal(
@@ -180,6 +211,7 @@ class AiQuoteRepository(
                     "model in Settings → AI Providers.",
                 provider = completion.provider,
                 model = completion.model,
+                stopBackgroundFetch = true,
             )
         }
 
@@ -293,6 +325,7 @@ class AiQuoteRepository(
         private const val MAX_QUOTE_CHARS = 4_000
         private const val MAX_CHAPTER_CHARS = 240
         private const val PREVIEW_CHARS = 400
+        private const val TERMINAL_STOP_WINDOW_MILLIS = 2_000L
         private const val TAG = "AiQuoteRepository"
         private val WHITESPACE = Regex("""\s+""")
     }

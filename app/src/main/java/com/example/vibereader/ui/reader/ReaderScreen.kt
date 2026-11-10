@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
+import android.graphics.Bitmap
 import android.os.Build
 import android.view.View
 import android.view.WindowInsets
@@ -69,6 +70,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.vibereader.core.database.VibeReaderDatabase
+import com.example.vibereader.data.document.PdfDocumentEngine
 import com.example.vibereader.data.local.DictionaryPreferences
 import com.example.vibereader.data.room.BookChapterEntity
 import com.example.vibereader.model.ReaderTtsVoice
@@ -78,6 +80,7 @@ import com.example.vibereader.util.FreeAiTtsPlayer
 import com.example.vibereader.util.SpeechProgress
 import com.example.vibereader.util.TtsManager
 import com.example.vibereader.util.displayTitle
+import java.io.File
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -107,6 +110,29 @@ private fun ReadingTheme.resolve(isSystemDark: Boolean): ResolvedReadingTheme = 
     ReadingTheme.LIGHT -> ResolvedReadingTheme(Color(0xFFFFFFFF), Color(0xFF1A1A1A), false)
 }
 
+/**
+ * Read-only map passed into the PDF pager/column. Every lookup synchronously
+ * checks the engine's [com.example.vibereader.data.document.PdfDocumentEngine]
+ * LRU cache during composition, then falls back to the ViewModel's persisted
+ * page bitmaps. When both exist, the higher-resolution bitmap wins so zoomed
+ * pages keep the ViewModel's high-quality render.
+ */
+private class PdfDisplayBitmapMap(
+    private val persistedBitmaps: Map<Int, Bitmap>,
+    private val engine: PdfDocumentEngine,
+) : Map<Int, Bitmap> by persistedBitmaps {
+    override fun get(key: Int): Bitmap? {
+        val cached = engine.getCachedPage(key)
+        val persisted = persistedBitmaps[key]
+        return when {
+            cached == null -> persisted
+            persisted == null -> cached
+            persisted.width >= cached.width -> persisted
+            else -> cached
+        }
+    }
+}
+
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
 fun ReaderScreen(
@@ -121,6 +147,11 @@ fun ReaderScreen(
         },
     )
     val state by viewModel.uiState.collectAsState()
+    val pdfEngine = remember(bookId) { PdfDocumentEngine(context.applicationContext) }
+    val pdfCacheVersion by pdfEngine.cacheVersion.collectAsState()
+    DisposableEffect(pdfEngine) {
+        onDispose { pdfEngine.clearPageCache() }
+    }
     val ttsManager = remember { TtsManager(context) }
     val edgeTtsPlayer = remember { FreeAiTtsPlayer(context) }
     val audioPrefs = remember {
@@ -300,6 +331,18 @@ fun ReaderScreen(
         ch?.title?.ifBlank { "Chapter ${idx + 1}" } ?: "Chapter"
     }
 
+    val pdfFile = remember(state.book?.filePath) {
+        state.book?.filePath?.takeIf(String::isNotBlank)?.let(::File)
+    }
+
+    // Composition-safe merge of ViewModel-rendered bitmaps and the engine's
+    // synchronous LRU cache. getCachedPage() is read during composition, so a
+    // prefetched neighbour paints on the first frame instead of flashing a
+    // spinner. pdfCacheVersion invalidates this map when a silent prefetch lands.
+    val pdfPageBitmaps = remember(state.pdfPageBitmaps, pdfCacheVersion, pdfEngine) {
+        PdfDisplayBitmapMap(state.pdfPageBitmaps, pdfEngine)
+    }
+
     Scaffold(
         modifier = Modifier
             .fillMaxSize()
@@ -380,14 +423,16 @@ fun ReaderScreen(
                         pageCount = state.pdfPageCount,
                         currentPage = state.pdfPageIndex,
                         scrollMode = state.settings.scrollMode,
-                        pageBitmaps = state.pdfPageBitmaps,
+                        pageBitmaps = pdfPageBitmaps,
                         savedHighlights = state.savedPdfHighlights,
                         aiProcessingPageIndex = state.aiProcessingPageIndex,
                         title = title,
                         theme = state.settings.readingTheme,
                         selection = state.selection,
                         speechSelection = state.speechHighlight,
-                        modifier = Modifier.fillMaxSize(),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(readerBackground),
                         jumpToPageRequest = pdfJumpRequest.takeIf { it >= 0 },
                         onPageChanged = viewModel::setPdfPageIndex,
                         onRenderPage = { pageIndex, width, height, zoomScale ->
@@ -397,6 +442,21 @@ fun ReaderScreen(
                                 requestedHeightPx = height,
                                 zoomScale = zoomScale,
                             )
+                            // Warm the engine's next/previous window while the
+                            // ViewModel renders the current page. At zoom > 1
+                            // the ViewModel's high-resolution render is the
+                            // authority; base-resolution neighbours are only
+                            // prefetched at fit scale.
+                            if (zoomScale <= 1.01f) {
+                                pdfFile?.let { file ->
+                                    pdfEngine.prefetchAround(
+                                        file = file,
+                                        pageIndex = pageIndex,
+                                        targetWidth = width,
+                                        targetHeight = height,
+                                    )
+                                }
+                            }
                         },
                         onCanvasTap = { chromeVisible = !chromeVisible },
                         onTextLongPress = viewModel::selectPdfTextAt,

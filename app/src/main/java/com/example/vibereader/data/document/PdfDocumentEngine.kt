@@ -8,14 +8,25 @@ import android.graphics.Rect
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import android.util.LruCache
 import com.example.vibereader.domain.model.EBookChapter
 import com.example.vibereader.domain.model.EBookFormat
 import com.example.vibereader.domain.model.EBookMetadata
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -37,9 +48,46 @@ import kotlin.math.sqrt
  * allocation is dynamically scaled and wrapped in try-catch so OOM/memory
  * pressure falls back safely instead of hanging; every opened page is closed in
  * a `finally` block.
+ *
+ * Page rendering uses an industry-standard previous/current/next window backed by
+ * an [LruCache] of [CACHE_PAGE_CAPACITY] page bitmaps. A requested page returns
+ * immediately on a cache hit; a miss renders on [PDF_RENDER_DISPATCHER] and then
+ * silently prefetches the adjacent pages on a non-blocking coroutine. The cache
+ * is scoped to the file identity (path + size + mtime) and is cleared when a
+ * different PDF is opened, so pages can never leak between books.
  */
 class PdfDocumentEngine(context: Context) : EBookParserEngine {
     private val appContext = context.applicationContext
+
+    /**
+     * The single dispatcher shared by every native [PdfRenderer] operation in
+     * this engine (requested renders, prefetches, and cover extraction).
+     */
+    private val pdfDispatcher: CoroutineDispatcher = PDF_RENDER_DISPATCHER
+
+    /** Fire-and-forget scope for silent adjacent-page prefetching. */
+    private val prefetchScope = CoroutineScope(SupervisorJob() + pdfDispatcher)
+
+    /** Previous/current/next window with headroom for fast page flips. */
+    private val pageCache = object : LruCache<Int, Bitmap>(CACHE_PAGE_CAPACITY) {
+        override fun sizeOf(key: Int, value: Bitmap): Int = 1
+    }
+
+    private val cacheLock = Any()
+    private var cacheIdentity: String? = null
+    private var pageCountIdentity: String? = null
+    private var pageCountValue: Int = 0
+
+    @Volatile
+    private var prefetchJob: Job? = null
+
+    /**
+     * Increments whenever a page bitmap is added to [pageCache]. Compose can
+     * collect this to re-read the cache synchronously during composition when a
+     * silent prefetch finishes after the page item was first composed.
+     */
+    private val _cacheVersion = MutableStateFlow(0)
+    val cacheVersion: StateFlow<Int> = _cacheVersion.asStateFlow()
 
     override val format: EBookFormat = EBookFormat.PDF
 
@@ -101,12 +149,215 @@ class PdfDocumentEngine(context: Context) : EBookParserEngine {
             false
         }
 
+    /**
+     * Synchronous, composition-safe cache read. Returns the already-rendered
+     * bitmap for [pageIndex] without dispatching or touching the native renderer.
+     */
+    fun getCachedPage(pageIndex: Int): Bitmap? = pageCache.get(pageIndex)
+
+    /**
+     * Schedules the silent previous/next window without re-rendering the current
+     * page. Called from the reader as soon as a page is requested so adjacent
+     * pages are ready before the user swipes to them.
+     */
+    fun prefetchAround(
+        file: File,
+        pageIndex: Int,
+        targetWidth: Int,
+        targetHeight: Int = 0,
+    ) {
+        if (!file.isFile || pageIndex < 0 || targetWidth <= 0) return
+        val identity = fileIdentity(file)
+        synchronized(cacheLock) {
+            if (cacheIdentity != identity) {
+                pageCache.evictAll()
+                cacheIdentity = identity
+            }
+        }
+        schedulePrefetch(file, identity, pageIndex, targetWidth, targetHeight)
+    }
+
+    /**
+     * Returns the bitmap for [pageIndex] using the standard three-page window.
+     *
+     * - A cache hit returns immediately without touching the native renderer.
+     * - A miss renders on [pdfDispatcher], stores the result, and returns it.
+     * - Immediately afterwards, adjacent pages (next and previous) are silently
+     *   prefetched by a non-blocking coroutine on the same dispatcher.
+     *
+     * The return value is never recycled by the cache; an evicted bitmap may
+     * still be safely displayed by the UI until it is garbage collected.
+     */
+    suspend fun renderPage(
+        file: File,
+        pageIndex: Int,
+        targetWidth: Int,
+        targetHeight: Int = 0,
+    ): Bitmap? {
+        if (!file.isFile || pageIndex < 0 || targetWidth <= 0) return null
+        val identity = fileIdentity(file)
+
+        val cached = cacheLookup(identity, pageIndex)
+        if (cached != null) {
+            schedulePrefetch(file, identity, pageIndex, targetWidth, targetHeight)
+            return cached
+        }
+
+        val rendered = withContext(pdfDispatcher) {
+            // Re-check inside the serialized dispatcher: a prefetch or another
+            // caller may have completed while this request was queued.
+            cacheLookup(identity, pageIndex) ?: run {
+                val bitmap = renderPageBitmapInternal(
+                    file = file,
+                    pageIndex = pageIndex,
+                    targetWidth = targetWidth,
+                    targetHeight = targetHeight,
+                )
+                if (bitmap != null) {
+                    cacheStore(identity, pageIndex, bitmap)
+                }
+                bitmap
+            }
+        }
+
+        if (rendered != null) {
+            schedulePrefetch(file, identity, pageIndex, targetWidth, targetHeight)
+        }
+        return rendered
+    }
+
+    /** Reads/caches the page count for [file]; safe to call from any dispatcher. */
+    suspend fun getPageCount(file: File): Int = withContext(pdfDispatcher) {
+        if (!file.isFile) return@withContext 0
+        pageCountOnDispatcher(file, fileIdentity(file))
+    }
+
+    /** Drops all memory-cached pages and cancels any in-flight prefetch. */
+    fun clearPageCache() {
+        prefetchJob?.cancel()
+        prefetchJob = null
+        synchronized(cacheLock) {
+            pageCache.evictAll()
+            cacheIdentity = null
+            pageCountIdentity = null
+            pageCountValue = 0
+        }
+        _cacheVersion.update { it + 1 }
+    }
+
+    private fun fileIdentity(file: File): String =
+        "${file.absolutePath}:${file.length()}:${file.lastModified()}"
+
+    /**
+     * A hit returns the bitmap directly. A different file identity evicts the
+     * previous book's window before the lookup so cross-book pages never leak.
+     */
+    private fun cacheLookup(identity: String, pageIndex: Int): Bitmap? = synchronized(cacheLock) {
+        if (cacheIdentity != identity) {
+            pageCache.evictAll()
+            cacheIdentity = identity
+        }
+        pageCache.get(pageIndex)
+    }
+
+    private fun cacheStore(identity: String, pageIndex: Int, bitmap: Bitmap) {
+        val stored = synchronized(cacheLock) {
+            if (cacheIdentity != identity) return
+            pageCache.put(pageIndex, bitmap)
+            true
+        }
+        if (stored) {
+            _cacheVersion.update { it + 1 }
+        }
+    }
+
+    /**
+     * Cancels the previous window's prefetch and launches a new non-blocking
+     * one for [pageIndex] +/- 1. Both jobs run on [pdfDispatcher], so native
+     * open/render/close calls remain strictly serialized with foreground renders.
+     */
+    private fun schedulePrefetch(
+        file: File,
+        identity: String,
+        pageIndex: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+    ) {
+        prefetchJob?.cancel()
+        prefetchJob = prefetchScope.launch {
+            try {
+                val totalPages = pageCountOnDispatcher(file, identity)
+                if (totalPages <= 0) return@launch
+                val neighbours = listOf(pageIndex + 1, pageIndex - 1)
+                for (neighbour in neighbours) {
+                    if (!isActive) return@launch
+                    if (neighbour !in 0 until totalPages) continue
+                    if (cacheLookup(identity, neighbour) != null) continue
+                    val bitmap = renderPageBitmapInternal(
+                        file = file,
+                        pageIndex = neighbour,
+                        targetWidth = targetWidth,
+                        targetHeight = targetHeight,
+                    ) ?: continue
+                    cacheStore(identity, neighbour, bitmap)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                // Silent: prefetch must never surface UI errors or interrupt reading.
+                Log.w(TAG, "Silent PDF prefetch failed for ${file.name} page=$pageIndex.", error)
+            }
+        }
+    }
+
+    /** Native page-count probe; only ever called on [pdfDispatcher]. */
+    private fun pageCountOnDispatcher(file: File, identity: String): Int {
+        synchronized(cacheLock) {
+            if (pageCountIdentity == identity) return pageCountValue
+        }
+        var descriptor: ParcelFileDescriptor? = null
+        var renderer: PdfRenderer? = null
+        return try {
+            descriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+            renderer = PdfRenderer(descriptor)
+            val count = renderer.pageCount
+            synchronized(cacheLock) {
+                pageCountIdentity = identity
+                pageCountValue = count
+            }
+            count
+        } catch (error: Throwable) {
+            Log.w(TAG, "Could not read PDF page count for ${file.name}.", error)
+            0
+        } finally {
+            try {
+                renderer?.close()
+            } catch (closeError: Throwable) {
+                Log.w(TAG, "Failed to close page-count PdfRenderer for ${file.name}.", closeError)
+            }
+            try {
+                descriptor?.close()
+            } catch (closeError: Throwable) {
+                Log.w(TAG, "Failed to close page-count descriptor for ${file.name}.", closeError)
+            }
+        }
+    }
+
     private fun String.withoutExtension(): String = substringBeforeLast('.', this)
 
     private companion object {
         const val TAG = "PdfDocumentEngine"
         const val COVER_WIDTH = 300
         const val COVER_HEIGHT = 400
+
+        /**
+         * 10 page bitmaps = a full previous/current/next window at both ends of
+         * a fast flip sequence, with headroom for Compose's off-screen pager
+         * prefetch. Bitmaps are never recycled while the cache drops them, so a
+         * page already being displayed remains valid until garbage collected.
+         */
+        const val CACHE_PAGE_CAPACITY = 10
+
         private const val MAX_BITMAP_PIXELS = 8_000_000L
         private const val MAX_BITMAP_DIMENSION = 2048
         private const val PREVIEW_MAX_DIMENSION = 720

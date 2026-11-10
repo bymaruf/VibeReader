@@ -7,6 +7,8 @@ import com.example.vibereader.data.remote.AiProviderHttpException
 import com.example.vibereader.model.AiProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
@@ -57,6 +59,18 @@ class AiRequestException(
     val provider: AiProvider? = null,
     val model: String? = null,
     val statusCode: Int? = null,
+    /**
+     * True when this request reached the end of the whole failover pool
+     * without a success. Callers such as the endless quote fetcher can use this
+     * to stop their background loop instead of retrying immediately.
+     */
+    val allKeysExhausted: Boolean = false,
+    /**
+     * Terminal failure for the current background operation. Always true for
+     * [allKeysExhausted]; also true for timeouts and unusable responses where
+     * an immediate automatic retry would simply repeat the same failure.
+     */
+    val stopBackgroundFetch: Boolean = allKeysExhausted,
     cause: Throwable? = null,
 ) : IOException(message, cause)
 
@@ -222,8 +236,11 @@ object AiRuntimeResolver {
  * provider's model ID.
  *
  * The UI only receives a failure after every key/provider in the pool has been
- * exhausted. A single hard timeout prevents the "Working…" state from hanging
- * when several providers each take a long time to fail.
+ * exhausted. A failed sweep is terminal: this manager throws one
+ * [AiRequestException] and never retries the pool internally, so callers can
+ * stop their background loop instead of hammering the same failing keys.
+ * A single hard timeout prevents the "Working…" state from hanging when
+ * several providers each take a long time to fail.
  */
 object AiFailoverManager {
     private const val TAG = "AiFailoverManager"
@@ -257,18 +274,26 @@ object AiFailoverManager {
             Log.e(AI_ERROR_TAG, "Execution error", error)
             throw error
         }
+        // Hard ceiling for one request attempt. The app stores one key per
+        // provider (seven providers today), so this allows the full pool while
+        // capping runaway growth if more providers/keys are added later.
+        val attempts = configs.take(MAX_FAILOVER_ATTEMPTS)
 
         Log.d(
             TAG,
-            "Failover pool (${configs.size}): " +
-                configs.joinToString { "${it.provider.shortLabel}:${it.model}" },
+            "Failover pool (${attempts.size}): " +
+                attempts.joinToString { "${it.provider.shortLabel}:${it.model}" },
         )
 
         val boundedTimeout = overallTimeoutMillis.coerceAtLeast(1_000L)
         val completion = withTimeoutOrNull(boundedTimeout) {
             var lastError: Throwable? = null
 
-            for ((index, config) in configs.withIndex()) {
+            for ((index, config) in attempts.withIndex()) {
+                // Stop immediately if the caller cancelled while a previous
+                // provider was failing; never start another request after a
+                // cancelled/finished fetch session.
+                currentCoroutineContext().ensureActive()
                 try {
                     val (text, usedModel) = executeProvider(
                         httpClient = httpClient,
@@ -282,7 +307,7 @@ object AiFailoverManager {
                     Log.d(
                         TAG,
                         "Provider ${config.provider.shortLabel} succeeded with " +
-                            "model=$usedModel [${index + 1}/${configs.size}].",
+                            "model=$usedModel [${index + 1}/${attempts.size}].",
                     )
                     return@withTimeoutOrNull AiCompletion(
                         text = text,
@@ -300,25 +325,28 @@ object AiFailoverManager {
                         logTag,
                         "AI request failed on ${config.provider.displayName} " +
                             "(model=${config.model}, key=${config.modelPreferenceKey}) " +
-                            "[${index + 1}/${configs.size}]; trying next provider.",
+                            "[${index + 1}/${attempts.size}]; trying next provider.",
                         error,
                     )
+                    // Honour cancellation before advancing to the next key.
+                    currentCoroutineContext().ensureActive()
                 }
             }
 
-            throw buildExhaustedException(configs, lastError)
+            throw buildExhaustedException(attempts, lastError)
         }
 
         completion ?: run {
             val timeoutError = AiRequestException(
                 message = "The AI request timed out. Check your internet connection " +
                     "and try again.",
+                stopBackgroundFetch = true,
             )
             Log.e(AI_ERROR_TAG, "Execution error", timeoutError)
             Log.e(
                 logTag,
                 "AI request exceeded the overall timeout of ${boundedTimeout}ms " +
-                    "after attempting ${configs.size} provider(s).",
+                    "after attempting ${attempts.size} provider(s).",
             )
             throw timeoutError
         }
@@ -408,7 +436,10 @@ object AiFailoverManager {
             provider = configs.lastOrNull()?.provider,
             model = configs.lastOrNull()?.model,
             statusCode = httpError?.statusCode,
+            allKeysExhausted = true,
             cause = lastError,
         )
     }
+
+    private const val MAX_FAILOVER_ATTEMPTS = 10
 }

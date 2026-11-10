@@ -962,11 +962,12 @@ class ReaderViewModel(
         _uiState.value = _uiState.value.copy(aiResult = null)
         guardedLaunch(Dispatchers.IO) {
             try {
-                val contextText = resolveAskAiContext(book)
-                if (contextText.isBlank()) {
-                    val message = "Open a page or select text before asking."
-                    showAiError(book, "Ask Book AI", message)
-                    return@guardedLaunch
+                // Ask Book must work even when nothing is selected and no page
+                // text has loaded yet. In that case the question is answered
+                // from the book as a whole instead of being blocked.
+                val contextText = resolveAskAiContext(book).ifBlank {
+                    "No specific passage is selected. " +
+                        "Answer from the book as a whole using the title and author."
                 }
                 val response = withTimeout(MAX_AI_OPERATION_MS) {
                     askAiEngine.askBook(

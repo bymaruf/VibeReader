@@ -42,6 +42,13 @@ private enum class AssistantScope(val label: String) {
     SELECTION("Selection"),
     CURRENT_PAGE("Current page"),
     CURRENT_CHAPTER("Chapter"),
+
+    /**
+     * Always available. Used automatically when there is no selection and no
+     * current page/chapter text, so Ask Book never depends on a passage being
+     * open before the user can type a question.
+     */
+    ENTIRE_BOOK("Entire book"),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -80,34 +87,46 @@ fun AiAssistantBottomSheet(
     val pitch by ttsManager.pitch
     val speed by ttsManager.speed
     val selectionAvailable = !selectionText.isNullOrBlank()
-    val chapterAvailable = !chapterText.isNullOrBlank()
+    val currentPageAvailable = isPdf && currentPageIndex != null
+    val chapterAvailable = !isPdf && !chapterText.isNullOrBlank()
     val scopes = buildList {
         if (selectionAvailable) add(AssistantScope.SELECTION)
-        if (isPdf) {
-            add(AssistantScope.CURRENT_PAGE)
-        } else if (chapterAvailable) {
-            add(AssistantScope.CURRENT_CHAPTER)
-        }
+        if (currentPageAvailable) add(AssistantScope.CURRENT_PAGE)
+        if (chapterAvailable) add(AssistantScope.CURRENT_CHAPTER)
+        // Always offered (and used as the automatic fallback) so a question can
+        // be asked even before any page/chapter text has loaded.
+        add(AssistantScope.ENTIRE_BOOK)
     }
-    var selectedScope by remember(selectionText, pageLabel, chapterTitle) {
+    var selectedScope by remember(
+        selectionText,
+        pageText,
+        chapterText,
+        pageLabel,
+        chapterTitle,
+        isPdf,
+        currentPageIndex,
+    ) {
         mutableStateOf(
-            if (selectionAvailable) AssistantScope.SELECTION
-            else if (isPdf) AssistantScope.CURRENT_PAGE
-            else AssistantScope.CURRENT_CHAPTER,
+            when {
+                selectionAvailable -> AssistantScope.SELECTION
+                currentPageAvailable -> AssistantScope.CURRENT_PAGE
+                chapterAvailable -> AssistantScope.CURRENT_CHAPTER
+                else -> AssistantScope.ENTIRE_BOOK
+            },
         )
     }
-    val activeScope = selectedScope.takeIf(scopes::contains) ?: scopes.firstOrNull()
+    val activeScope = selectedScope.takeIf(scopes::contains) ?: scopes.first()
     val activeText = when (activeScope) {
         AssistantScope.SELECTION -> selectionText.orEmpty()
         AssistantScope.CURRENT_PAGE -> pageText.orEmpty()
         AssistantScope.CURRENT_CHAPTER -> chapterText.orEmpty()
-        null -> ""
+        AssistantScope.ENTIRE_BOOK -> ""
     }
     val activeLabel = when (activeScope) {
         AssistantScope.SELECTION -> "Selected passage"
         AssistantScope.CURRENT_PAGE -> pageLabel
         AssistantScope.CURRENT_CHAPTER -> chapterTitle ?: pageLabel
-        null -> pageLabel
+        AssistantScope.ENTIRE_BOOK -> "Entire book"
     }
     val speechButtonLabel = when {
         (useNativePlayback && isSpeaking) ||
@@ -178,18 +197,23 @@ fun AiAssistantBottomSheet(
             }
 
             Text("Choose a scope", style = MaterialTheme.typography.labelLarge)
-            if (scopes.isNotEmpty()) {
-                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                    scopes.forEachIndexed { index, scope ->
-                        SegmentedButton(
-                            selected = activeScope == scope,
-                            onClick = { selectedScope = scope },
-                            shape = SegmentedButtonDefaults.itemShape(index, scopes.size),
-                        ) {
-                            Text(scope.label)
-                        }
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                scopes.forEachIndexed { index, scope ->
+                    SegmentedButton(
+                        selected = activeScope == scope,
+                        onClick = { selectedScope = scope },
+                        shape = SegmentedButtonDefaults.itemShape(index, scopes.size),
+                    ) {
+                        Text(scope.label)
                     }
                 }
+            }
+            if (activeScope == AssistantScope.ENTIRE_BOOK) {
+                Text(
+                    text = "No passage selected — Ask Book will answer from the whole book.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
             if (activeScope == AssistantScope.SELECTION && selectionText != null) {
@@ -207,10 +231,10 @@ fun AiAssistantBottomSheet(
                         AssistantScope.SELECTION -> onSummarizeSelection()
                         AssistantScope.CURRENT_PAGE -> onSummarizePage()
                         AssistantScope.CURRENT_CHAPTER -> onSummarizeChapter()
-                        null -> Unit
+                        AssistantScope.ENTIRE_BOOK -> Unit
                     }
                 },
-                enabled = !isWorking && activeScope != null,
+                enabled = !isWorking && activeScope != AssistantScope.ENTIRE_BOOK,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(if (isWorking) "Working…" else "Summarize")
@@ -334,7 +358,7 @@ fun AiAssistantBottomSheet(
                             else -> onSpeakPage()
                         }
                     },
-                    enabled = activeScope != null && !isEdgeLoading,
+                    enabled = !isEdgeLoading,
                     modifier = Modifier.weight(1f),
                 ) {
                     Text(speechButtonLabel)
