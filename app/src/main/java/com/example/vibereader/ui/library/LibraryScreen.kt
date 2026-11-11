@@ -9,20 +9,22 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -116,8 +118,10 @@ fun LibraryScreen(
         modifier = Modifier
             .fillMaxSize()
             .padding(contentPadding)
-            .padding(horizontal = 20.dp, vertical = 20.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
+            // Scaffold/NavHost already apply the status-bar inset; only add the
+            // compact 4.dp breathing room on top of it.
+            .padding(start = 16.dp, end = 16.dp, top = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Crossfade(
             targetState = isSearchActive,
@@ -162,30 +166,11 @@ fun LibraryScreen(
                     singleLine = true,
                 )
             } else {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(
-                            "LIBRARY",
-                            style = MaterialTheme.typography.headlineSmall,
-                            color = MaterialTheme.colorScheme.onBackground,
-                        )
-                        Text(
-                            "Your books, ready when you are.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    Spacer(Modifier.weight(1f))
-                    IconButton(onClick = { isSearchActive = true }) {
-                        Icon(
-                            imageVector = LibraryIcons.Search,
-                            contentDescription = "Search",
-                        )
-                    }
-                }
+                LibraryHeaderRow(
+                    gridLayout = gridLayout,
+                    onGridLayoutChange = { gridLayout = it },
+                    onSearchClick = { isSearchActive = true },
+                )
             }
         }
         scanState.errorMessage?.let { message ->
@@ -218,45 +203,15 @@ fun LibraryScreen(
         }
 
         if (scannedBooks.isNotEmpty()) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "RECENTLY READ",
-                    style = MaterialTheme.typography.titleSmall,
-                    letterSpacing = 1.5.sp,
-                    fontWeight = FontWeight.Bold,
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    listOf(true to "GRID", false to "LIST").forEach { (isGrid, label) ->
-                        val selected = gridLayout == isGrid
-                        val containerColor by animateColorAsState(
-                            targetValue = if (selected) MaterialTheme.colorScheme.onSurface
-                            else MaterialTheme.colorScheme.surfaceVariant,
-                            label = "library-layout-toggle",
-                        )
-                        val contentColor by animateColorAsState(
-                            targetValue = if (selected) MaterialTheme.colorScheme.surface
-                            else MaterialTheme.colorScheme.onSurfaceVariant,
-                            label = "library-layout-toggle-text",
-                        )
-                        Surface(
-                            onClick = { gridLayout = isGrid },
-                            shape = RoundedCornerShape(50),
-                            color = containerColor,
-                            contentColor = contentColor,
-                        ) {
-                            Text(
-                                label,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-                                style = MaterialTheme.typography.labelSmall,
-                            )
-                        }
-                    }
-                }
-            }
+            Text(
+                text = "RECENTLY READ",
+                modifier = Modifier.padding(vertical = 2.dp),
+                fontSize = 12.sp,
+                lineHeight = 14.sp,
+                letterSpacing = 1.2.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
 
         AnimatedContent(
@@ -335,6 +290,91 @@ fun LibraryScreen(
 }
 
 @Composable
+private fun LibraryHeaderRow(
+    gridLayout: Boolean,
+    onGridLayoutChange: (Boolean) -> Unit,
+    onSearchClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(40.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "LIBRARY",
+            fontSize = 20.sp,
+            lineHeight = 22.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.2.sp,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+        Spacer(Modifier.weight(1f))
+        Box(
+            modifier = Modifier
+                .size(32.dp)
+                .clip(RoundedCornerShape(50))
+                .clickable(onClick = onSearchClick)
+                .semantics { contentDescription = "Search" },
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = LibraryIcons.Search,
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.width(6.dp))
+        LibraryLayoutToggle(
+            gridLayout = gridLayout,
+            onGridLayoutChange = onGridLayoutChange,
+        )
+    }
+}
+
+@Composable
+private fun LibraryLayoutToggle(
+    gridLayout: Boolean,
+    onGridLayoutChange: (Boolean) -> Unit,
+) {
+    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        listOf(true to "GRID", false to "LIST").forEach { (isGrid, label) ->
+            val selected = gridLayout == isGrid
+            val containerColor by animateColorAsState(
+                targetValue = if (selected) MaterialTheme.colorScheme.onSurface
+                else MaterialTheme.colorScheme.surfaceVariant,
+                label = "library-layout-toggle",
+            )
+            val contentColor by animateColorAsState(
+                targetValue = if (selected) MaterialTheme.colorScheme.surface
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+                label = "library-layout-toggle-text",
+            )
+            Box(
+                modifier = Modifier
+                    .height(28.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(containerColor)
+                    .clickable { onGridLayoutChange(isGrid) }
+                    .padding(horizontal = 9.dp)
+                    .semantics { contentDescription = "$label view" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = label,
+                    color = contentColor,
+                    fontSize = 10.sp,
+                    lineHeight = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 0.4.sp,
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun BookCollection(
     books: List<BookEntity>,
     progressByBook: Map<String, ReadingProgressEntity>,
@@ -355,93 +395,118 @@ private fun BookGrid(
     haptic: HapticFeedback,
     context: android.content.Context,
 ) {
-    LazyVerticalGrid(
-        columns = GridCells.Adaptive(minSize = 150.dp),
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(bottom = 24.dp),
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        gridItems(books, key = { it.id }) { book ->
-            val readingProgress = progressByBook[book.id]?.progress?.coerceIn(0f, 1f) ?: 0f
-            val displayTitle = book.displayTitle()
-            val interactionSource = remember { MutableInteractionSource() }
-            val pressed by interactionSource.collectIsPressedAsState()
-            val scale by animateFloatAsState(
-                targetValue = if (pressed) 0.975f else 1f,
-                animationSpec = spring(stiffness = 500f, dampingRatio = 0.72f),
-                label = "book-card-scale",
-            )
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .graphicsLayer {
-                        scaleX = scale
-                        scaleY = scale
-                    }
-                    .combinedClickable(
-                        interactionSource = interactionSource,
-                        indication = null,
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onBookSelected(book.id)
-                        },
-                        onLongClick = { haptic.performHapticFeedback(HapticFeedbackType.LongPress) },
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val rowSpacing = 8.dp
+        val safeHeight = if (maxHeight.value.isFinite() && maxHeight > 0.dp) {
+            maxHeight
+        } else {
+            640.dp
+        }
+        // Exactly three rows fit the viewport: 2 columns x 3 rows = 6 covers visible.
+        val cardHeight = ((safeHeight - rowSpacing * 2) / 3f).coerceAtLeast(140.dp)
+
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(bottom = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(rowSpacing),
+        ) {
+            gridItems(books, key = { it.id }) { book ->
+                val readingProgress = progressByBook[book.id]?.progress?.coerceIn(0f, 1f) ?: 0f
+                val displayTitle = book.displayTitle()
+                val interactionSource = remember { MutableInteractionSource() }
+                val pressed by interactionSource.collectIsPressedAsState()
+                val scale by animateFloatAsState(
+                    targetValue = if (pressed) 0.975f else 1f,
+                    animationSpec = spring(stiffness = 500f, dampingRatio = 0.72f),
+                    label = "book-card-scale",
+                )
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(cardHeight)
+                        .graphicsLayer {
+                            scaleX = scale
+                            scaleY = scale
+                        }
+                        .combinedClickable(
+                            interactionSource = interactionSource,
+                            indication = null,
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onBookSelected(book.id)
+                            },
+                            onLongClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            },
+                        ),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
                     ),
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-            ) {
-                Column {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .aspectRatio(2f / 3f)
-                            .clip(RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp))
-                            .background(MaterialTheme.colorScheme.surface),
-                    ) {
-                        BookCover(
-                            title = displayTitle,
-                            coverImagePath = book.coverImagePath,
-                            modifier = Modifier.fillMaxSize(),
-                        )
-                        FormatBadge(
-                            format = book.format,
-                            modifier = Modifier.align(Alignment.TopStart).padding(10.dp),
-                        )
-                        BookShareMenu(
-                            book = book,
-                            context = context,
-                            modifier = Modifier.align(Alignment.TopEnd),
-                        )
+                    elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                ) {
+                    Column {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                                .clip(RoundedCornerShape(topStart = 10.dp, topEnd = 10.dp))
+                                .background(MaterialTheme.colorScheme.surface),
+                        ) {
+                            BookCover(
+                                title = displayTitle,
+                                coverImagePath = book.coverImagePath,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                            FormatBadge(
+                                format = book.format,
+                                modifier = Modifier.align(Alignment.TopStart).padding(6.dp),
+                            )
+                            BookShareMenu(
+                                book = book,
+                                context = context,
+                                modifier = Modifier.align(Alignment.TopEnd),
+                            )
+                        }
+                        Column(
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                text = displayTitle,
+                                fontSize = 12.sp,
+                                lineHeight = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 2,
+                                minLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = book.author ?: "Unknown author",
+                                    modifier = Modifier.weight(1f),
+                                    fontSize = 10.sp,
+                                    lineHeight = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    text = "${(readingProgress * 100).toInt()}%",
+                                    fontSize = 9.sp,
+                                    lineHeight = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        ReadingProgressBar(readingProgress)
                     }
-                    Column(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 11.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        Text(
-                            text = displayTitle,
-                            style = MaterialTheme.typography.titleSmall,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            minLines = 2,
-                        )
-                        Text(
-                            text = book.author ?: "Unknown author",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            text = "${(readingProgress * 100).toInt()}% read",
-                            modifier = Modifier.padding(top = 4.dp),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    ReadingProgressBar(readingProgress)
                 }
             }
         }
@@ -551,14 +616,16 @@ private fun BookShareMenu(
     Box(modifier = modifier) {
         IconButton(
             onClick = { expanded = true },
-            modifier = Modifier.semantics {
-                contentDescription = "Actions for ${book.displayTitle()}"
-            },
+            modifier = Modifier
+                .size(32.dp)
+                .semantics {
+                    contentDescription = "Actions for ${book.displayTitle()}"
+                },
         ) {
             Text(
                 text = "⋮",
                 color = MaterialTheme.colorScheme.onSurface,
-                style = MaterialTheme.typography.titleLarge,
+                style = MaterialTheme.typography.titleMedium,
             )
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {

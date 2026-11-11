@@ -16,13 +16,18 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarDefaults
-import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -33,9 +38,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -203,32 +213,20 @@ private fun VibeReaderApp(
         containerColor = MaterialTheme.colorScheme.background,
         bottomBar = {
             if (!isReader) {
-                NavigationBar(
-                    containerColor = MaterialTheme.colorScheme.surface,
-                    contentColor = MaterialTheme.colorScheme.onSurface,
-                    // The bar paints its container color behind the system
-                    // navigation buttons, then pads its content by this inset.
-                    windowInsets = NavigationBarDefaults.windowInsets,
-                ) {
-                    destinations.forEach { destination ->
-                        val selected = currentDestination?.hierarchy?.any {
-                            it.route == destination.route
-                        } == true
-                        NavigationBarItem(
-                            selected = selected,
-                            onClick = {
-                                runCatching {
-                                    navController.navigate(destination.route) {
-                                        launchSingleTop = true
-                                        restoreState = true
-                                    }
-                                }
-                            },
-                            icon = { Text(destination.marker) },
-                            label = { Text(destination.label) },
-                        )
-                    }
-                }
+                CompactNavigationBar(
+                    destinations = destinations,
+                    isSelected = { route ->
+                        currentDestination?.hierarchy?.any { it.route == route } == true
+                    },
+                    onNavigate = { route ->
+                        runCatching {
+                            navController.navigate(route) {
+                                launchSingleTop = true
+                                restoreState = true
+                            }
+                        }
+                    },
+                )
             }
         },
     ) { innerPadding ->
@@ -257,6 +255,66 @@ private fun VibeReaderApp(
                     bookId = bookId,
                     onBack = { runCatching { navController.popBackStack() } },
                 )
+            }
+        }
+    }
+}
+
+/**
+ * Ultra-slim navigation bar (50.dp of content + the single system navigation
+ * inset). Replaces Material 3's 80.dp NavigationBar and its selection pill.
+ */
+@Composable
+private fun CompactNavigationBar(
+    destinations: List<AppDestination>,
+    isSelected: (String) -> Boolean,
+    onNavigate: (String) -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .height(50.dp),
+        ) {
+            destinations.forEach { destination ->
+                val selected = isSelected(destination.route)
+                val contentColor = if (selected) {
+                    MaterialTheme.colorScheme.onSurface
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                }
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .selectable(
+                            selected = selected,
+                            onClick = { onNavigate(destination.route) },
+                            role = Role.Tab,
+                        ),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    Text(
+                        text = destination.marker,
+                        color = contentColor,
+                        fontSize = 17.sp,
+                        lineHeight = 18.sp,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                    )
+                    Text(
+                        text = destination.label,
+                        modifier = Modifier.padding(top = 2.dp),
+                        color = contentColor,
+                        fontSize = 10.sp,
+                        lineHeight = 11.sp,
+                        maxLines = 1,
+                    )
+                }
             }
         }
     }
