@@ -25,10 +25,19 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.example.vibereader.data.room.BookChapterEntity
 
+/**
+ * Renders one chapter, or exactly one pre-computed viewport slice of a chapter.
+ *
+ * Horizontal mode always passes a [pageSlice]; in that case the renderer never
+ * paginates or scrolls and maps every local selection/highlight offset back into
+ * chapter-relative coordinates using [EpubPageSlice.startCharOffset].
+ */
 @Composable
 fun EpubChapterRenderer(
     chapter: BookChapterEntity,
@@ -45,18 +54,16 @@ fun EpubChapterRenderer(
     onCanvasTap: () -> Unit,
     onSelectionChanged: (ReaderSelection?) -> Unit,
     modifier: Modifier = Modifier,
-    /** When non-null, render only this viewport slice (horizontal pagination mode). */
-    pageText: String? = null,
-    /** Chapter-relative start offset of [pageText]; required when [pageText] is set. */
-    pageStartOffset: Int = 0,
-    /** Show the chapter title (typically only on the first page of a chapter). */
+    /** When non-null, render only this line-bounded viewport slice. */
+    pageSlice: EpubPageSlice? = null,
+    /** Show the chapter title (typically only on the first slice of a chapter). */
     showTitle: Boolean = true,
     /** Enable vertical scrolling inside the page. Disabled for horizontal viewport pages. */
     scrollEnabled: Boolean = true,
 ) {
     val scrollState = rememberScrollState()
-    val displayText = pageText ?: chapter.text
-    val baseOffset = if (pageText != null) pageStartOffset.coerceAtLeast(0) else 0
+    val displayText = pageSlice?.slicedText ?: chapter.text
+    val baseOffset = pageSlice?.startCharOffset?.coerceAtLeast(0) ?: 0
     val pageHighlightStart = highlightStartOffset?.let { it - baseOffset }
     val pageHighlightEnd = highlightEndOffset?.let { it - baseOffset }
 
@@ -64,7 +71,7 @@ fun EpubChapterRenderer(
         modifier = modifier
             .fillMaxSize()
             .background(background)
-            .pointerInput(chapter.bookId, chapterIndex, pageStartOffset) {
+            .pointerInput(chapter.bookId, chapterIndex, baseOffset) {
                 detectTapGestures(onTap = { onCanvasTap() })
             }
             .then(if (scrollEnabled) Modifier.verticalScroll(scrollState) else Modifier)
@@ -75,10 +82,15 @@ fun EpubChapterRenderer(
             Text(
                 text = chapter.title,
                 color = foreground,
-                style = MaterialTheme.typography.titleLarge,
+                style = MaterialTheme.typography.titleLarge.copy(
+                    fontSize = (fontSize.value * 1.35f).sp,
+                    lineHeight = (lineHeight.value * 1.2f).sp,
+                ),
+                maxLines = 4,
+                overflow = TextOverflow.Ellipsis,
             )
         }
-        if (displayText.isBlank()) {
+        if (displayText.isEmpty()) {
             Text(
                 text = "Empty Chapter",
                 color = foreground,
