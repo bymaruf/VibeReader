@@ -15,12 +15,18 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
@@ -61,6 +67,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
+import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
@@ -248,6 +255,9 @@ private fun VibeReaderApp(
                     onNavigate = { route ->
                         runCatching {
                             navController.navigate(route) {
+                                popUpTo(navController.graph.findStartDestination().id) {
+                                    saveState = true
+                                }
                                 launchSingleTop = true
                                 restoreState = true
                             }
@@ -261,18 +271,10 @@ private fun VibeReaderApp(
             navController = navController,
             startDestination = "library",
             modifier = Modifier.padding(innerPadding),
-            enterTransition = {
-                fadeIn(tween(durationMillis = 150, easing = FastOutSlowInEasing))
-            },
-            exitTransition = {
-                fadeOut(tween(durationMillis = 150, easing = FastOutSlowInEasing))
-            },
-            popEnterTransition = {
-                fadeIn(tween(durationMillis = 150, easing = FastOutSlowInEasing))
-            },
-            popExitTransition = {
-                fadeOut(tween(durationMillis = 150, easing = FastOutSlowInEasing))
-            },
+            enterTransition = { EnterTransition.None },
+            exitTransition = { ExitTransition.None },
+            popEnterTransition = { EnterTransition.None },
+            popExitTransition = { ExitTransition.None },
         ) {
             composable("library") {
                 LibraryScreen(
@@ -288,12 +290,39 @@ private fun VibeReaderApp(
                 // same StateFlow that MainActivity collects for VibeReaderTheme.
                 SettingsScreen(viewModel = settingsViewModel)
             }
-            composable("reader/{bookId}") { entry ->
+            composable(
+                route = "reader/{bookId}",
+                enterTransition = {
+                    slideInHorizontally(
+                        animationSpec = tween(180, easing = FastOutSlowInEasing),
+                        initialOffsetX = { it / 6 },
+                    ) + fadeIn(tween(180, easing = FastOutSlowInEasing))
+                },
+                exitTransition = {
+                    slideOutHorizontally(
+                        animationSpec = tween(180, easing = FastOutSlowInEasing),
+                        targetOffsetX = { it / 6 },
+                    ) + fadeOut(tween(180, easing = FastOutSlowInEasing))
+                },
+                popEnterTransition = { EnterTransition.None },
+                popExitTransition = {
+                    slideOutHorizontally(
+                        animationSpec = tween(180, easing = FastOutSlowInEasing),
+                        targetOffsetX = { it / 6 },
+                    ) + fadeOut(tween(180, easing = FastOutSlowInEasing))
+                },
+            ) { entry ->
                 val bookId = entry.arguments?.getString("bookId").orEmpty()
-                ReaderScreen(
-                    bookId = bookId,
-                    onBack = { runCatching { navController.popBackStack() } },
-                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.background),
+                ) {
+                    ReaderScreen(
+                        bookId = bookId,
+                        onBack = { runCatching { navController.popBackStack() } },
+                    )
+                }
             }
         }
     }

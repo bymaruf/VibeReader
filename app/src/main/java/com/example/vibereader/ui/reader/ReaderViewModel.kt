@@ -156,6 +156,14 @@ class ReaderViewModel(
     private var pdfRenderer: PdfRenderer? = null
     private var pdfRendererBookId: String? = null
     private var progressJob: Job? = null
+
+    /**
+     * Last progress requested for persistence. Kept outside viewModelScope so
+     * [onCleared] can flush it on IO after the reader route leaves, even if
+     * the debounced write was still pending.
+     */
+    @Volatile
+    private var pendingProgress: Triple<String, String, Float>? = null
     private var pdfSelectionJob: Job? = null
     private var pdfHighlightsJob: Job? = null
     private var pdfPageTextJob: Job? = null
@@ -218,8 +226,9 @@ class ReaderViewModel(
         synchronized(pdfLayoutLock) { pdfPageLayouts.clear() }
         guardedLaunch {
             _uiState.value = ReaderUiState(isLoading = true)
-            // Let the reader route and its lightweight loading frame render
-            // before database access, renderer teardown, or PDF parsing start.
+            // Let the reader route and its lightweight loading frame render,
+            // then wait out the 180 ms open transition before database
+            // access, renderer teardown, or PDF parsing start.
             delay(OPEN_DEFERRAL_MS)
             withContext(Dispatchers.IO) { closePdfRenderer() }
             try {
@@ -1493,6 +1502,7 @@ class ReaderViewModel(
 
     private fun persistProgress(location: String, progress: Float) {
         val bookId = _uiState.value.book?.id ?: return
+        pendingProgress = Triple(bookId, location, progress)
         progressJob?.cancel()
         progressJob = guardedLaunch {
             kotlinx.coroutines.delay(PROGRESS_SAVE_DELAY_MS)
@@ -1659,10 +1669,23 @@ class ReaderViewModel(
     }
 
     override fun onCleared() {
-        // Native renderer teardown can outlast a frame. Run it off the main
-        // thread so leaving the reader never stalls the exit transition.
+        val pending = pendingProgress
+        // Native renderer teardown and the final progress write can outlast a
+        // frame. Run both off the main thread so leaving the reader never
+        // stalls the exit transition.
         CoroutineScope(Dispatchers.IO).launch {
             runCatching { closePdfRenderer() }
+            if (pending != null) {
+                runCatching {
+                    database.readingProgressDao().upsert(
+                        ReadingProgressEntity(pending.first, pending.second, pending.third),
+                    )
+                    bookRepository.updateLastReadTimestamp(
+                        pending.first,
+                        System.currentTimeMillis(),
+                    )
+                }
+            }
         }
         super.onCleared()
     }
@@ -1699,7 +1722,7 @@ class ReaderViewModel(
         const val MAX_PDF_PAGE_TEXT_CHARS = 1_000_000
         const val PDF_LAYOUT_WAIT_TIMEOUT_MS = 250L
         const val PROGRESS_SAVE_DELAY_MS = 500L
-        const val OPEN_DEFERRAL_MS = 60L
+        const val OPEN_DEFERRAL_MS = 180L
         val EPUB_LOCATION_REGEX = Regex("""epub:(\d+):(\d+)""")
     }
 

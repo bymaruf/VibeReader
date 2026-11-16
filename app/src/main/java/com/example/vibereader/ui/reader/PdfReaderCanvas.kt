@@ -3,9 +3,9 @@ package com.example.vibereader.ui.reader
 import android.graphics.Bitmap
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.lazy.LazyColumn
@@ -132,17 +132,26 @@ fun PdfReaderCanvas(
                     count = pageCount,
                     key = { pageIndex -> "$bookId:$pageIndex" },
                 ) { pageIndex ->
+                    val pageBitmap = pageBitmaps[pageIndex]
+                    val pageAspectRatio = pageBitmap
+                        ?.takeIf { it.height > 0 }
+                        ?.let { it.width.toFloat() / it.height.toFloat() }
+                        ?.takeIf { it.isFinite() && it > 0f }
+                        ?: DEFAULT_PDF_PAGE_ASPECT_RATIO
                     PdfPageRenderer(
                         pageIndex = pageIndex,
-                        bitmap = pageBitmaps[pageIndex],
+                        bitmap = pageBitmap,
                         title = title,
                         theme = theme,
                         selection = selection,
                         speechSelection = speechSelection,
                         savedHighlights = savedHighlights,
                         aiProcessingPageIndex = aiProcessingPageIndex,
+                        // The page slot is sized to the page's own aspect
+                        // ratio, so Fit never letterboxes inside a taller
+                        // fullscreen viewport and the 8dp gap stays constant.
                         fitToBounds = true,
-                        modifier = Modifier.fillMaxWidth().height(maxHeight),
+                        modifier = Modifier.fillMaxWidth().aspectRatio(pageAspectRatio),
                         onRenderPage = onRenderPage,
                         onCanvasTap = onCanvasTap,
                         onTextLongPress = onTextLongPress,
@@ -157,3 +166,7 @@ fun PdfReaderCanvas(
         }
     }
 }
+
+// A4 portrait ratio. Used only until a rendered bitmap supplies the real page
+// ratio, so loading pages keep a stable height instead of collapsing.
+private const val DEFAULT_PDF_PAGE_ASPECT_RATIO = 0.7071f

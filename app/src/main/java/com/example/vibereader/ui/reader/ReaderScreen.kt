@@ -58,6 +58,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -87,6 +88,8 @@ import com.example.vibereader.util.SpeechProgress
 import com.example.vibereader.util.TtsManager
 import com.example.vibereader.util.displayTitle
 import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -257,6 +260,11 @@ fun ReaderScreen(
     }
 
     LaunchedEffect(bookId) {
+        // Let the reader route compose and draw its lightweight loading
+        // surface before any database or file work is scheduled. The
+        // ViewModel keeps a short deferral so the open animation finishes
+        // before parsing starts.
+        withFrameNanos { }
         viewModel.loadBook(bookId)
     }
 
@@ -276,8 +284,15 @@ fun ReaderScreen(
 
     DisposableEffect(edgeTtsPlayer, ttsManager) {
         onDispose {
-            edgeTtsPlayer.stop()
-            ttsManager.shutdown()
+            // Releasing MediaPlayer and the platform TTS engine can take
+            // longer than a frame; do it off the main thread so pressing
+            // Back returns to the library immediately.
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching {
+                    edgeTtsPlayer.stop()
+                    ttsManager.shutdown()
+                }
+            }
         }
     }
 

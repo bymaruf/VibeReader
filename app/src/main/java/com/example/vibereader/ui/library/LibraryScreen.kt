@@ -54,6 +54,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -101,10 +102,12 @@ fun LibraryScreen(
             LibraryViewModel.Factory(context.applicationContext, database)
         },
     )
-    val books by libraryViewModel.books.collectAsStateWithLifecycle(initialValue = emptyList())
+    val loadedBooks by libraryViewModel.books.collectAsStateWithLifecycle()
+    val books = loadedBooks.orEmpty()
     val searchQuery by libraryViewModel.searchQuery.collectAsStateWithLifecycle()
     val scanState by libraryViewModel.scanState.collectAsStateWithLifecycle()
-    val progress by database.readingProgressDao().observeAll().collectAsState(initial = emptyList())
+    val progressFlow = remember(database) { database.readingProgressDao().observeAll() }
+    val progress by progressFlow.collectAsState(initial = emptyList())
     val progressByBook = remember(progress) { progress.associateBy { it.bookId } }
     val scannedBooks = remember(books) { books.filter { it.isDeviceScanned } }
     val haptic = LocalHapticFeedback.current
@@ -113,7 +116,11 @@ fun LibraryScreen(
     val searchFocusRequester = remember { FocusRequester() }
 
     LaunchedEffect(scanEnabled) {
-        if (scanEnabled) libraryViewModel.scanDeviceForBooks()
+        if (scanEnabled) {
+            // Let the first skeleton frame draw before touching the filesystem.
+            withFrameNanos { }
+            libraryViewModel.scanDeviceForBooksOnce()
+        }
     }
 
     Column(
@@ -218,6 +225,7 @@ fun LibraryScreen(
 
         AnimatedContent(
             targetState = when {
+                loadedBooks == null -> "initial"
                 scanState.isScanning || scanState.isProcessingMetadata -> "loading"
                 scannedBooks.isEmpty() && searchQuery.isNotBlank() -> "no_results"
                 scannedBooks.isEmpty() -> "empty"
@@ -227,6 +235,7 @@ fun LibraryScreen(
             label = "library-content",
         ) { content ->
             when (content) {
+                "initial" -> LibraryLoadingSkeleton()
                 "loading" -> Box(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center,
@@ -285,6 +294,93 @@ fun LibraryScreen(
                         showGrid,
                         context,
                     )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LibraryLoadingSkeleton() {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val rowSpacing = 8.dp
+        val safeHeight = if (maxHeight.value.isFinite() && maxHeight > 0.dp) {
+            maxHeight
+        } else {
+            640.dp
+        }
+        // Mirror the live grid: six cards fill the viewport in 2 x 3 rows.
+        val cardHeight = ((safeHeight - rowSpacing * 2) / 3f).coerceAtLeast(140.dp)
+
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(bottom = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(rowSpacing),
+            userScrollEnabled = false,
+        ) {
+            repeat(6) { index ->
+                item(
+                    key = "library-skeleton-$index",
+                    contentType = "library-skeleton",
+                ) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(cardHeight),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                        ),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            MaterialTheme.colorScheme.outline.copy(alpha = 0.25f),
+                        ),
+                    ) {
+                        Column {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .weight(1f)
+                                    .background(
+                                        MaterialTheme.colorScheme.surface.copy(alpha = 0.55f),
+                                    ),
+                            )
+                            Column(
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                verticalArrangement = Arrangement.spacedBy(5.dp),
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth(0.82f)
+                                        .height(10.dp)
+                                        .clip(RoundedCornerShape(3.dp))
+                                        .background(
+                                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f),
+                                        ),
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth(0.55f)
+                                        .height(8.dp)
+                                        .clip(RoundedCornerShape(3.dp))
+                                        .background(
+                                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.07f),
+                                        ),
+                                )
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(2.dp)
+                                    .background(
+                                        MaterialTheme.colorScheme.outline.copy(alpha = 0.18f),
+                                    ),
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -428,6 +524,17 @@ private fun BookGrid(
                     animationSpec = spring(stiffness = 500f, dampingRatio = 0.72f),
                     label = "book-card-scale",
                 )
+                // Reuse one click lambda per item instead of allocating new
+                // ones on every recomposition while the grid scrolls.
+                val openBook = remember(book.id, onBookSelected, haptic) {
+                    {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onBookSelected(book.id)
+                    }
+                }
+                val longPress = remember(haptic) {
+                    { haptic.performHapticFeedback(HapticFeedbackType.LongPress) }
+                }
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -439,13 +546,8 @@ private fun BookGrid(
                         .combinedClickable(
                             interactionSource = interactionSource,
                             indication = null,
-                            onClick = {
-                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                onBookSelected(book.id)
-                            },
-                            onLongClick = {
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            },
+                            onClick = openBook,
+                            onLongClick = longPress,
                         ),
                     shape = RoundedCornerShape(10.dp),
                     colors = CardDefaults.cardColors(
@@ -546,6 +648,15 @@ private fun BookList(
                 animationSpec = spring(stiffness = 500f, dampingRatio = 0.72f),
                 label = "book-list-item-scale",
             )
+            val openBook = remember(book.id, onBookSelected, haptic) {
+                {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onBookSelected(book.id)
+                }
+            }
+            val longPress = remember(haptic) {
+                { haptic.performHapticFeedback(HapticFeedbackType.LongPress) }
+            }
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -556,11 +667,8 @@ private fun BookList(
                     .combinedClickable(
                         interactionSource = interactionSource,
                         indication = null,
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onBookSelected(book.id)
-                        },
-                        onLongClick = { haptic.performHapticFeedback(HapticFeedbackType.LongPress) },
+                        onClick = openBook,
+                        onLongClick = longPress,
                     ),
                 shape = RoundedCornerShape(12.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -668,19 +776,26 @@ private fun BookCover(
         } else {
             768
         }.coerceAtLeast(1)
+        val cachedCover = remember(coverImagePath, targetWidth, targetHeight) {
+            BookCoverCache.peek(coverImagePath, targetWidth, targetHeight)
+        }
         val bitmap by produceState<Bitmap?>(
-            initialValue = null,
+            initialValue = cachedCover,
             coverImagePath,
             targetWidth,
             targetHeight,
         ) {
-            value = BookCoverCache.load(coverImagePath, targetWidth, targetHeight)
+            // A cache hit was seeded synchronously above, so a card scrolled
+            // back into view paints its cover on the very first frame instead
+            // of flashing the letter placeholder.
+            value = cachedCover ?: BookCoverCache.load(coverImagePath, targetWidth, targetHeight)
         }
 
         val cover = bitmap
         if (cover != null) {
+            val imageBitmap = remember(cover) { cover.asImageBitmap() }
             Image(
-                bitmap = cover.asImageBitmap(),
+                bitmap = imageBitmap,
                 contentDescription = "$title cover",
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),
@@ -704,8 +819,20 @@ private fun BookCover(
 private object BookCoverCache {
     private const val MAX_CACHE_BYTES = 16 * 1024 * 1024
 
-    private val cache = object : LruCache<String, Bitmap>(MAX_CACHE_BYTES) {
-        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    private class Entry(val stamp: String, val bitmap: Bitmap)
+
+    private val cache = object : LruCache<String, Entry>(MAX_CACHE_BYTES) {
+        override fun sizeOf(key: String, value: Entry): Int = value.bitmap.byteCount
+    }
+
+    /**
+     * Synchronous, allocation-light probe used while composing a card. A hit
+     * paints immediately; the file stamp is validated later during [load] so
+     * this never touches the filesystem on the UI thread.
+     */
+    fun peek(path: String?, targetWidth: Int, targetHeight: Int): Bitmap? {
+        val filePath = path ?: return null
+        return cache.get(sizeKey(filePath, targetWidth, targetHeight))?.bitmap
     }
 
     suspend fun load(
@@ -714,18 +841,9 @@ private object BookCoverCache {
         targetHeight: Int,
     ): Bitmap? = withContext(Dispatchers.IO) {
         val file = path?.let(::File)?.takeIf(File::isFile) ?: return@withContext null
-        val key = buildString {
-            append(file.absolutePath)
-            append(':')
-            append(file.lastModified())
-            append(':')
-            append(file.length())
-            append(':')
-            append(targetWidth)
-            append('x')
-            append(targetHeight)
-        }
-        cache.get(key)?.let { return@withContext it }
+        val key = sizeKey(file.absolutePath, targetWidth, targetHeight)
+        val stamp = "${file.lastModified()}:${file.length()}"
+        cache.get(key)?.takeIf { it.stamp == stamp }?.let { return@withContext it.bitmap }
 
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, bounds)
@@ -741,8 +859,11 @@ private object BookCoverCache {
         }
         runCatching { BitmapFactory.decodeFile(file.absolutePath, options) }
             .getOrNull()
-            ?.also { decoded -> cache.put(key, decoded) }
+            ?.also { decoded -> cache.put(key, Entry(stamp, decoded)) }
     }
+
+    private fun sizeKey(path: String, targetWidth: Int, targetHeight: Int): String =
+        "$path:${targetWidth}x$targetHeight"
 
     private fun calculateInSampleSize(
         outWidth: Int,

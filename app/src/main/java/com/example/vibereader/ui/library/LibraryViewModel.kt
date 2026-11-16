@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.io.File
 
 data class LibraryScanState(
@@ -51,22 +53,26 @@ class LibraryViewModel(
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
 
     /**
-     * Full catalog used for cover extraction. Kept separate from [books] so a
-     * search term never prevents covers for other books from being prepared.
+     * Null until the Room catalog query has emitted its first real result.
+     * Keeping the load state on the same flow as the list prevents the
+     * "loaded + empty" and "not loaded + empty" states from racing each other.
      */
-    private val allBooks: StateFlow<List<BookEntity>> =
+    private val allBooks: StateFlow<List<BookEntity>?> =
         database.bookDao().getAllBooksSortedByRecent().stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5_000),
-            initialValue = emptyList(),
+            initialValue = null,
         )
 
     /**
      * In-memory search + Last Activity ordering. The database flow is only
      * queried when the catalog changes; each keystroke filters this list
      * locally, so typing never triggers a Room query.
+     *
+     * A null value means the initial Room emission has not arrived yet.
      */
-    val books: StateFlow<List<BookEntity>> = combine(allBooks, _searchQuery) { catalog, query ->
+    val books: StateFlow<List<BookEntity>?> = combine(allBooks, _searchQuery) { catalog, query ->
+        if (catalog == null) return@combine null
         val term = query.trim()
         catalog.asSequence()
             .filter { book ->
@@ -81,26 +87,41 @@ class LibraryViewModel(
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),
-        initialValue = emptyList(),
+        initialValue = null,
     )
 
     private val coverExtractionRequests = mutableSetOf<String>()
+    private val coverExtractionGate = Semaphore(permits = 2)
+    private var hasRequestedInitialScan = false
 
     init {
         viewModelScope.launch {
             allBooks.collect { catalog ->
-                catalog.forEach { book ->
+                catalog.orEmpty().forEach { book ->
                     val sourceFile = File(book.filePath).takeIf(File::isFile) ?: return@forEach
                     if (book.coverImagePath?.let(::File)?.isFile == true) return@forEach
                     val requestKey = "${book.id}:${sourceFile.absolutePath}"
                     if (coverExtractionRequests.add(requestKey)) {
                         launch(Dispatchers.IO) {
-                            repository.ensureCoverImage(book)
+                            coverExtractionGate.withPermit {
+                                repository.ensureCoverImage(book)
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Starts the automatic library scan only once per LibraryViewModel. The
+     * Library composable can be recreated without recreating its ViewModel;
+     * without this guard every return would launch another full device scan.
+     */
+    fun scanDeviceForBooksOnce() {
+        if (hasRequestedInitialScan) return
+        hasRequestedInitialScan = true
+        scanDeviceForBooks()
     }
 
     fun setSearchQuery(query: String) {
