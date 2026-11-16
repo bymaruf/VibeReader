@@ -53,10 +53,13 @@ fun PdfPageRenderer(
     }
     val pdfColorFilter = when (theme) {
         ReadingTheme.OLED_BLACK -> PdfColorMatrix.OLED_NIGHT_FILTER
+        ReadingTheme.SYSTEM -> if (isSystemInDarkTheme()) {
+            PdfColorMatrix.OLED_NIGHT_FILTER
+        } else {
+            null
+        }
         ReadingTheme.SEPIA -> PdfColorMatrix.SEPIA_FILTER
-        ReadingTheme.SYSTEM,
-        ReadingTheme.LIGHT,
-        -> null
+        ReadingTheme.LIGHT -> null
     }
 
     Box(
