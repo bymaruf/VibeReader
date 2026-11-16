@@ -15,6 +15,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -257,6 +261,18 @@ private fun VibeReaderApp(
             navController = navController,
             startDestination = "library",
             modifier = Modifier.padding(innerPadding),
+            enterTransition = {
+                fadeIn(tween(durationMillis = 150, easing = FastOutSlowInEasing))
+            },
+            exitTransition = {
+                fadeOut(tween(durationMillis = 150, easing = FastOutSlowInEasing))
+            },
+            popEnterTransition = {
+                fadeIn(tween(durationMillis = 150, easing = FastOutSlowInEasing))
+            },
+            popExitTransition = {
+                fadeOut(tween(durationMillis = 150, easing = FastOutSlowInEasing))
+            },
         ) {
             composable("library") {
                 LibraryScreen(

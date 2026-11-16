@@ -2,6 +2,7 @@ package com.example.vibereader.ui.library
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.util.LruCache
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateColorAsState
@@ -67,6 +68,7 @@ import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.hapticfeedback.HapticFeedback
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -412,7 +414,11 @@ private fun BookGrid(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalArrangement = Arrangement.spacedBy(rowSpacing),
         ) {
-            gridItems(books, key = { it.id }) { book ->
+            gridItems(
+                books,
+                key = { it.id },
+                contentType = { "library-grid-book" },
+            ) { book ->
                 val readingProgress = progressByBook[book.id]?.progress?.coerceIn(0f, 1f) ?: 0f
                 val displayTitle = book.displayTitle()
                 val interactionSource = remember { MutableInteractionSource() }
@@ -526,7 +532,11 @@ private fun BookList(
         contentPadding = PaddingValues(bottom = 24.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        columnItems(books, key = { it.id }) { book ->
+        columnItems(
+            books,
+            key = { it.id },
+            contentType = { "library-list-book" },
+        ) { book ->
             val progress = progressByBook[book.id]?.progress?.coerceIn(0f, 1f) ?: 0f
             val displayTitle = book.displayTitle()
             val interactionSource = remember { MutableInteractionSource() }
@@ -646,16 +656,27 @@ private fun BookCover(
     coverImagePath: String?,
     modifier: Modifier = Modifier,
 ) {
-    val bitmap by produceState<Bitmap?>(initialValue = null, coverImagePath) {
-        value = withContext(Dispatchers.IO) {
-            coverImagePath
-                ?.let(::File)
-                ?.takeIf(File::isFile)
-                ?.let { BitmapFactory.decodeFile(it.absolutePath) }
+    BoxWithConstraints(modifier = modifier, contentAlignment = Alignment.Center) {
+        val density = LocalDensity.current
+        val targetWidth = if (maxWidth.value.isFinite()) {
+            with(density) { maxWidth.roundToPx() }
+        } else {
+            512
+        }.coerceAtLeast(1)
+        val targetHeight = if (maxHeight.value.isFinite()) {
+            with(density) { maxHeight.roundToPx() }
+        } else {
+            768
+        }.coerceAtLeast(1)
+        val bitmap by produceState<Bitmap?>(
+            initialValue = null,
+            coverImagePath,
+            targetWidth,
+            targetHeight,
+        ) {
+            value = BookCoverCache.load(coverImagePath, targetWidth, targetHeight)
         }
-    }
 
-    Box(modifier = modifier, contentAlignment = Alignment.Center) {
         val cover = bitmap
         if (cover != null) {
             Image(
@@ -672,6 +693,72 @@ private fun BookCover(
                 fontWeight = FontWeight.Bold,
             )
         }
+    }
+}
+
+/**
+ * Small in-memory cover cache with sampled decoding. Covers are decoded off the
+ * main thread at the size the card actually needs, so scrolling a large library
+ * never stalls a frame on full-resolution bitmap work.
+ */
+private object BookCoverCache {
+    private const val MAX_CACHE_BYTES = 16 * 1024 * 1024
+
+    private val cache = object : LruCache<String, Bitmap>(MAX_CACHE_BYTES) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
+
+    suspend fun load(
+        path: String?,
+        targetWidth: Int,
+        targetHeight: Int,
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        val file = path?.let(::File)?.takeIf(File::isFile) ?: return@withContext null
+        val key = buildString {
+            append(file.absolutePath)
+            append(':')
+            append(file.lastModified())
+            append(':')
+            append(file.length())
+            append(':')
+            append(targetWidth)
+            append('x')
+            append(targetHeight)
+        }
+        cache.get(key)?.let { return@withContext it }
+
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@withContext null
+
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = calculateInSampleSize(
+                outWidth = bounds.outWidth,
+                outHeight = bounds.outHeight,
+                reqWidth = targetWidth,
+                reqHeight = targetHeight,
+            )
+        }
+        runCatching { BitmapFactory.decodeFile(file.absolutePath, options) }
+            .getOrNull()
+            ?.also { decoded -> cache.put(key, decoded) }
+    }
+
+    private fun calculateInSampleSize(
+        outWidth: Int,
+        outHeight: Int,
+        reqWidth: Int,
+        reqHeight: Int,
+    ): Int {
+        var sampleSize = 1
+        if (outHeight > reqHeight || outWidth > reqWidth) {
+            val halfHeight = outHeight / 2
+            val halfWidth = outWidth / 2
+            while (halfHeight / sampleSize >= reqHeight && halfWidth / sampleSize >= reqWidth) {
+                sampleSize *= 2
+            }
+        }
+        return sampleSize
     }
 }
 

@@ -46,6 +46,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
@@ -217,7 +218,10 @@ class ReaderViewModel(
         synchronized(pdfLayoutLock) { pdfPageLayouts.clear() }
         guardedLaunch {
             _uiState.value = ReaderUiState(isLoading = true)
-            closePdfRenderer()
+            // Let the reader route and its lightweight loading frame render
+            // before database access, renderer teardown, or PDF parsing start.
+            delay(OPEN_DEFERRAL_MS)
+            withContext(Dispatchers.IO) { closePdfRenderer() }
             try {
                 val result = withContext(Dispatchers.IO) {
                     Triple(
@@ -1655,7 +1659,11 @@ class ReaderViewModel(
     }
 
     override fun onCleared() {
-        closePdfRenderer()
+        // Native renderer teardown can outlast a frame. Run it off the main
+        // thread so leaving the reader never stalls the exit transition.
+        CoroutineScope(Dispatchers.IO).launch {
+            runCatching { closePdfRenderer() }
+        }
         super.onCleared()
     }
 
@@ -1691,6 +1699,7 @@ class ReaderViewModel(
         const val MAX_PDF_PAGE_TEXT_CHARS = 1_000_000
         const val PDF_LAYOUT_WAIT_TIMEOUT_MS = 250L
         const val PROGRESS_SAVE_DELAY_MS = 500L
+        const val OPEN_DEFERRAL_MS = 60L
         val EPUB_LOCATION_REGEX = Regex("""epub:(\d+):(\d+)""")
     }
 

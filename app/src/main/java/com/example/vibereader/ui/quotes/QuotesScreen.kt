@@ -223,7 +223,7 @@ fun QuotesScreen(contentPadding: PaddingValues = PaddingValues()) {
         contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 24.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        item(key = "wallpaper-studio") {
+        item(key = "wallpaper-studio", contentType = "wallpaper-studio") {
             WallpaperStudioSection(
                 wallpapers = wallpapers,
                 approvedQuotes = approvedQuotesForPreview,
@@ -304,7 +304,7 @@ fun QuotesScreen(contentPadding: PaddingValues = PaddingValues()) {
                 isFetchingQuotes = isFetchingWallpaperQuotes,
             )
         }
-        item(key = "quote-library-header") {
+        item(key = "quote-library-header", contentType = "quote-library-header") {
             Column(
                 modifier = Modifier.animateContentSize(),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -414,7 +414,7 @@ fun QuotesScreen(contentPadding: PaddingValues = PaddingValues()) {
             }
         }
         quoteGroups.forEach { group ->
-            item(key = "header-${group.source}") {
+            item(key = "header-${group.source}", contentType = "quote-section-header") {
                 QuoteSectionHeader(
                     source = group.source,
                     count = group.quotes.size,
@@ -422,14 +422,18 @@ fun QuotesScreen(contentPadding: PaddingValues = PaddingValues()) {
                 )
             }
             if (group.quotes.isEmpty()) {
-                item(key = "empty-${group.source}") {
+                item(key = "empty-${group.source}", contentType = "quote-section-empty") {
                     QuoteSectionEmpty(
                         source = group.source,
                         modifier = Modifier.animateItem(),
                     )
                 }
             } else {
-                items(group.quotes, key = { "${group.source}-${it.id}" }) { quote ->
+                items(
+                    group.quotes,
+                    key = { "${group.source}-${it.id}" },
+                    contentType = { "quote-card" },
+                ) { quote ->
                     QuoteCard(
                         quote = quote,
                         bookTitle = titlesByBook[quote.bookId] ?: "Unknown book",
@@ -461,7 +465,7 @@ fun QuotesScreen(contentPadding: PaddingValues = PaddingValues()) {
             }
         }
         if (quoteGroups.isEmpty()) {
-            item(key = "quote-filter-empty") {
+            item(key = "quote-filter-empty", contentType = "quote-filter-empty") {
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
