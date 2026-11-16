@@ -70,7 +70,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.vibereader.core.database.VibeReaderDatabase
 import com.example.vibereader.data.document.PdfDocumentEngine
@@ -321,13 +324,20 @@ fun ReaderScreen(
         }
         onDispose {
             if (window != null) {
-                WindowCompat.setDecorFitsSystemWindows(window, true)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    window.insetsController?.show(WindowInsets.Type.systemBars())
-                } else {
-                    @Suppress("DEPRECATION")
-                    window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
-                }
+                // Restore the main-tab chrome immediately when the reader
+                // leaves. Setting decor-fitting to false first collapses the
+                // platform nav inset, so CompactNavigationBar's single
+                // navigationBarsPadding() cannot add a second ~48dp strip.
+                WindowCompat.setDecorFitsSystemWindows(window, false)
+                val view = window.decorView
+                val controller = WindowCompat.getInsetsController(window, view)
+                controller.show(WindowInsetsCompat.Type.systemBars())
+                controller.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+                controller.isAppearanceLightNavigationBars = false
+                @Suppress("DEPRECATION")
+                window.navigationBarColor = android.graphics.Color.TRANSPARENT
+                ViewCompat.requestApplyInsets(view)
             }
         }
     }

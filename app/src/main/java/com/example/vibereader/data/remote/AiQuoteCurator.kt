@@ -3,11 +3,10 @@ package com.example.vibereader.data.remote
 import android.content.Context
 import android.util.Log
 import com.example.vibereader.data.local.AiKeyVault
+import com.example.vibereader.data.repository.AiFailoverManager
 import com.example.vibereader.domain.QuoteQualityValidator
 import com.example.vibereader.domain.model.EBookDocument
 import com.example.vibereader.domain.model.EBookQuote
-import com.example.vibereader.model.AiProvider
-import kotlinx.coroutines.CancellationException
 import okhttp3.OkHttpClient
 import org.json.JSONArray
 import org.json.JSONObject
@@ -29,7 +28,7 @@ class AiQuoteCurator(context: Context) {
     private val delegate = WallpaperQuoteCurator(context)
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(90, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
         .callTimeout(FETCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build()
 
@@ -81,64 +80,8 @@ class AiQuoteCurator(context: Context) {
         batchSize: Int = DEFAULT_BATCH_SIZE,
         alreadyCollected: List<String> = emptyList(),
     ): List<String> {
-        val keyStore = AiKeyVault(appContext)
-        val configs = keyStore
-            .getEnabledProviderConfigs(keyStore.getSelectedProvider())
-            .filter { it.isEnabled && it.apiKey.isNotBlank() }
-        if (configs.isEmpty()) {
-            throw IOException("Add an API key for the selected AI provider in Settings.")
-        }
-
-        var lastError: Throwable? = null
-        val attempted = mutableListOf<String>()
-        for (config in configs) {
-            attempted += config.provider.shortLabel
-            try {
-                val model = keyStore.getAiModel(config.provider)
-                    ?.takeIf(String::isNotBlank)
-                    ?: config.provider.defaultModel
-                val quotes = requestQuotes(
-                    provider = config.provider,
-                    apiKey = config.apiKey,
-                    model = model,
-                    bookTitle = bookTitle,
-                    bookAuthor = bookAuthor,
-                    count = batchSize.coerceAtLeast(1),
-                    alreadyCollected = alreadyCollected,
-                )
-                if (quotes.isNotEmpty()) return quotes
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                lastError = error
-                Log.w(
-                    TAG,
-                    "Quote fetch failed on ${config.provider.displayName}; trying next.",
-                    error,
-                )
-            }
-        }
-
-        val detail = lastError?.localizedMessage?.takeIf(String::isNotBlank)
-        val message = if (lastError == null) {
-            "The AI returned no new quotes. It may have exhausted this book."
-        } else {
-            "All ${configs.size} AI providers failed while fetching quotes " +
-                "(${attempted.joinToString()})." +
-                (detail?.let { " Last error: $it" } ?: "")
-        }
-        throw IOException(message, lastError)
-    }
-
-    private suspend fun requestQuotes(
-        provider: AiProvider,
-        apiKey: String,
-        model: String,
-        bookTitle: String,
-        bookAuthor: String?,
-        count: Int,
-        alreadyCollected: List<String> = emptyList(),
-    ): List<String> {
+        val keyVault = AiKeyVault(appContext)
+        val count = batchSize.coerceAtLeast(1)
         val authorHint = bookAuthor?.takeIf(String::isNotBlank)?.let { " by $it" }.orEmpty()
         val systemPrompt =
             "You are a literary quote curator. Return only a JSON array of strings. " +
@@ -156,20 +99,36 @@ class AiQuoteCurator(context: Context) {
             "Find up to $count new, profound, complete, and highly meaningful quotes from " +
                 "the book '$bookTitle'$authorHint. Return as a JSON array of strings. " +
                 "If fewer new quotes remain, return as many as you can find.$exclusion"
-        val response = AiProviderClient.executeChat(
-            client = httpClient,
-            provider = provider,
-            apiKey = apiKey,
-            model = model,
+
+        // The shared manager rotates every provider/key, applies 429 cooldowns
+        // and 401/403 blacklisting, and only moves on after retryable failures
+        // are exhausted. Keep parsing/quality validation here so a 200 response
+        // with unusable prose also fails over to the next key.
+        val completion = AiFailoverManager.completeValidated(
+            keyVault = keyVault,
+            httpClient = httpClient,
             systemPrompt = systemPrompt,
             userContent = userContent,
             maxTokens = MAX_FETCH_TOKENS,
             temperature = 0.5,
+            logTag = TAG,
+            validate = { response ->
+                val quotes = parseQuoteArray(response)
+                    .filter(QuoteQualityValidator::isValidQuote)
+                    .distinct()
+                    .take(count)
+                if (quotes.isEmpty()) {
+                    throw IOException("The AI response contained no usable quotes.")
+                }
+                quotes
+            },
         )
-        return parseQuoteArray(response)
-            .filter(QuoteQualityValidator::isValidQuote)
-            .distinct()
-            .take(count)
+        Log.d(
+            TAG,
+            "Quote fetch succeeded via ${completion.provider.shortLabel} " +
+                "model=${completion.model} with ${completion.value.size} quote(s).",
+        )
+        return completion.value
     }
 
     /**

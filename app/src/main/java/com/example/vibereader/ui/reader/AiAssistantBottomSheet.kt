@@ -51,6 +51,12 @@ private enum class AssistantScope(val label: String) {
     ENTIRE_BOOK("Entire book"),
 }
 
+/**
+ * Internal request used by the "Entire book" Summarize button. The ViewModel
+ * intercepts it before normal question handling and sends only title/author.
+ */
+internal const val ENTIRE_BOOK_SUMMARY_COMMAND = "__vibereader_entire_book_summary__"
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AiAssistantBottomSheet(
@@ -231,10 +237,10 @@ fun AiAssistantBottomSheet(
                         AssistantScope.SELECTION -> onSummarizeSelection()
                         AssistantScope.CURRENT_PAGE -> onSummarizePage()
                         AssistantScope.CURRENT_CHAPTER -> onSummarizeChapter()
-                        AssistantScope.ENTIRE_BOOK -> Unit
+                        AssistantScope.ENTIRE_BOOK -> onAskBookAi(ENTIRE_BOOK_SUMMARY_COMMAND)
                     }
                 },
-                enabled = !isWorking && activeScope != AssistantScope.ENTIRE_BOOK,
+                enabled = !isWorking,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(if (isWorking) "Working…" else "Summarize")

@@ -38,18 +38,87 @@ data class DiscoveredModel(
         }
 }
 
+/**
+ * OpenCode advertises stealth/free models that are only callable from its
+ * first-party CLI/client. A model whose ID ends in `-free` is still shown in
+ * Settings, but its dropdown label warns that it may time out in the mobile
+ * app. Known non-free stealth entries are removed entirely.
+ *
+ * The catalog has no explicit "cli-only" flag, so the policy combines a known
+ * blocklist with the metadata OpenCode publishes for stealth models.
+ */
+object OpenCodeModelPolicy {
+    /** Exact warning appended to `*-free` OpenCode model labels. */
+    const val CLI_ONLY_WARNING = "CLI-only (may time out in mobile app)"
+
+    private val hardBlockedIds = setOf(
+        "big-pickle",
+    )
+
+    private val restrictedIdMarkers = listOf(
+        "cli-only",
+        "cli_only",
+        "client-only",
+        "client_only",
+    )
+
+    private val restrictedDescriptionMarkers = listOf(
+        "cli-only",
+        "cli only",
+        "client-only",
+        "client only",
+        "opencode client",
+        "stealth",
+    )
+
+    /**
+     * True for an OpenCode `*-free` ID. These remain selectable but are flagged
+     * because they commonly require the OpenCode CLI and can time out here.
+     */
+    fun isFreeCliModel(id: String): Boolean {
+        val normalizedId = id.trim().lowercase()
+        if (normalizedId.isBlank()) return false
+        return normalizedId.endsWith("-free") || normalizedId.contains("-free-")
+    }
+
+    /**
+     * True when [id] is known to be unavailable through third-party REST
+     * clients and should not appear in the dropdown at all. Free models are
+     * exempt because they are exposed with [CLI_ONLY_WARNING] instead.
+     * [description] is the catalog's model description, when present.
+     */
+    fun isRestrictedModel(id: String, description: String? = null): Boolean {
+        val normalizedId = id.trim().lowercase()
+        if (normalizedId.isBlank()) return false
+        if (isFreeCliModel(normalizedId)) return false
+        if (normalizedId in hardBlockedIds) return true
+        if (restrictedIdMarkers.any(normalizedId::contains)) return true
+        val normalizedDescription = description?.lowercase().orEmpty()
+        return restrictedDescriptionMarkers.any(normalizedDescription::contains)
+    }
+
+    /** Dropdown/supporting label for an OpenCode model. */
+    fun displayName(id: String, name: String): String =
+        if (isFreeCliModel(id)) "$name — $CLI_ONLY_WARNING" else name
+}
+
 class ModelDiscoveryService(
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .callTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .callTimeout(60, TimeUnit.SECONDS)
         .build(),
 ) {
     suspend fun fetchAvailableModels(
         provider: AiProvider,
         apiKey: String,
     ): List<DiscoveredModel> = withContext(Dispatchers.IO) {
-        require(apiKey.isNotBlank()) { "Add an API key before discovering models." }
-        validateApiKeyIfNeeded(provider, apiKey)
-        val request = createRequest(provider, apiKey)
+        val normalizedKey = apiKey.trim().trim('"', '\'').trim()
+        require(normalizedKey.isNotBlank()) {
+            "Add an API key before discovering models."
+        }
+        validateApiKeyIfNeeded(provider, normalizedKey)
+        val request = createRequest(provider, normalizedKey)
         client.newCall(request).execute().use { response ->
             val body = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
@@ -149,6 +218,11 @@ class ModelDiscoveryService(
         ).firstOrNull {
             it.isNotBlank() && it != rawId && it != "models/$rawId"
         } ?: rawId
+        val modelName = if (provider == AiProvider.OPENCODE) {
+            OpenCodeModelPolicy.displayName(rawId, displayName)
+        } else {
+            displayName
+        }
         val inputModalities = item.optJSONObject("architecture")
             ?.optJSONArray("input_modalities")
             ?: item.optJSONObject("modalities")?.optJSONArray("input")
@@ -159,7 +233,7 @@ class ModelDiscoveryService(
         val idLower = rawId.lowercase()
         return DiscoveredModel(
             id = rawId,
-            name = displayName,
+            name = modelName,
             isFree = isFreeModel(provider, rawId, item),
             supportsImages = supportsImages,
             isFast = listOf(
@@ -196,6 +270,9 @@ class ModelDiscoveryService(
             return false
         }
         if (provider == AiProvider.OPENCODE) {
+            if (OpenCodeModelPolicy.isRestrictedModel(id, item.optString("description"))) {
+                return false
+            }
             val type = item.optString("type").lowercase()
             if (type.isNotBlank() && type != "chat") return false
         }

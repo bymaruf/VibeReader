@@ -6,6 +6,8 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.example.vibereader.data.room.AiResponseDao
+import com.example.vibereader.data.room.AiResponseEntity
 import com.example.vibereader.data.room.BookDao
 import com.example.vibereader.data.room.BookEntity
 import com.example.vibereader.data.room.BookReadingThemeDao
@@ -33,8 +35,9 @@ import com.example.vibereader.data.room.AppThemePreferenceEntity
         ReaderPreferenceEntity::class,
         AppThemePreferenceEntity::class,
         BookReadingThemeEntity::class,
+        AiResponseEntity::class,
     ],
-    version = 14,
+    version = 15,
     exportSchema = true,
 )
 abstract class VibeReaderDatabase : RoomDatabase() {
@@ -46,6 +49,7 @@ abstract class VibeReaderDatabase : RoomDatabase() {
     abstract fun readerPreferenceDao(): ReaderPreferenceDao
     abstract fun appThemePreferenceDao(): AppThemePreferenceDao
     abstract fun bookReadingThemeDao(): BookReadingThemeDao
+    abstract fun aiResponseDao(): AiResponseDao
 
     companion object {
         private const val DATABASE_NAME = "vibereader.db"
@@ -280,6 +284,35 @@ abstract class VibeReaderDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_14_15 = object : Migration(14, 15) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Local AI-response cache: repeated questions, page summaries,
+                // and quote batches are served without another provider call.
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS ai_response_cache (
+                        bookId TEXT NOT NULL,
+                        cacheKind TEXT NOT NULL,
+                        queryHash TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        createdAt INTEGER NOT NULL,
+                        PRIMARY KEY(bookId, cacheKind, queryHash),
+                        FOREIGN KEY(bookId) REFERENCES books(id)
+                            ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_ai_response_cache_bookId " +
+                        "ON ai_response_cache(bookId)",
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_ai_response_cache_bookId_cacheKind " +
+                        "ON ai_response_cache(bookId, cacheKind)",
+                )
+            }
+        }
+
         @Volatile
         private var instance: VibeReaderDatabase? = null
 
@@ -303,6 +336,7 @@ abstract class VibeReaderDatabase : RoomDatabase() {
                     MIGRATION_11_12,
                     MIGRATION_12_13,
                     MIGRATION_13_14,
+                    MIGRATION_14_15,
                 )
                     .build()
                     .also { instance = it }

@@ -18,6 +18,7 @@ import com.example.vibereader.data.remote.AiProviderHttpException
 import com.example.vibereader.data.repository.AiConfigurationException
 import com.example.vibereader.data.repository.AiFailoverManager
 import com.example.vibereader.data.repository.AiRequestException
+import com.example.vibereader.data.repository.AiResponseCache
 import com.example.vibereader.data.repository.AiRuntimeResolver
 import com.example.vibereader.data.repository.AskAiEngine
 import com.example.vibereader.data.repository.BookParserRepository
@@ -32,6 +33,7 @@ import com.example.vibereader.data.room.QuoteSource
 import com.example.vibereader.data.room.ReadingProgressEntity
 import com.example.vibereader.data.room.ReaderPreferenceEntity
 import com.example.vibereader.domain.model.EBookFormat
+import com.example.vibereader.domain.prompt.AiContextSanitizer
 import com.example.vibereader.model.ReadingTheme
 import com.example.vibereader.util.PdfPageCache
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
@@ -132,7 +134,8 @@ class ReaderViewModel(
     // Lazily created: EncryptedSharedPreferences/keystore setup must not run
     // during ViewModel construction (a corrupted keystore would otherwise
     // crash the reader before the user even presses an AI button).
-    private val askAiEngine by lazy { AskAiEngine(appContext) }
+    private val askAiEngine by lazy { AskAiEngine(appContext, responseCache = aiResponseCache) }
+    private val aiResponseCache by lazy { AiResponseCache(database) }
     private val stateLock = Any()
     private val renderingPages = mutableSetOf<String>()
     private val renderedPdfPages = mutableSetOf<String>()
@@ -955,6 +958,10 @@ class ReaderViewModel(
         val trimmedQuestion = question.trim()
         if (trimmedQuestion.isEmpty()) return
         val book = _uiState.value.book ?: return
+        if (trimmedQuestion == ENTIRE_BOOK_SUMMARY_COMMAND) {
+            summarizeEntireBook(book)
+            return
+        }
         // A synchronous guard prevents double-taps from starting two requests
         // whose finally blocks could unlock "Working…" while the other is live.
         if (_uiState.value.isWorking) return
@@ -963,18 +970,21 @@ class ReaderViewModel(
         guardedLaunch(Dispatchers.IO) {
             try {
                 // Ask Book must work even when nothing is selected and no page
-                // text has loaded yet. In that case the question is answered
-                // from the book as a whole instead of being blocked.
-                val contextText = resolveAskAiContext(book).ifBlank {
-                    "No specific passage is selected. " +
-                        "Answer from the book as a whole using the title and author."
-                }
+                // text has loaded yet. The engine tries a zero-context
+                // title/author answer first, then falls back to locally scored
+                // paragraphs. The assistant sheet's scope is not passed through
+                // its callback, so the question wording decides whether the
+                // current passage is required.
+                val askContext = resolveAskAiContext(book)
                 val response = withTimeout(MAX_AI_OPERATION_MS) {
                     askAiEngine.askBook(
                         context = AskAiEngine.BookContext(
                             bookTitle = book.title,
                             author = book.author,
-                            contextText = contextText,
+                            contextText = askContext.text,
+                            bookId = book.id,
+                            bookChapters = _uiState.value.chapters.map { it.text },
+                            contextIsExcerpt = askContext.isExcerpt,
                         ),
                         question = trimmedQuestion,
                     )
@@ -1045,30 +1055,45 @@ class ReaderViewModel(
      * Builds the exact context sent with an Ask AI question. Priority:
      * selected text, the visible PDF page, then the chapter the reader is
      * actually on (not merely the initially restored chapter).
+     *
+     * [AskAiContext.isExcerpt] tells the engine that the text is already the
+     * exact passage and does not need paragraph scoring. Chapter text is scored
+     * locally instead of being sent whole.
      */
-    private suspend fun resolveAskAiContext(book: BookEntity): String {
+    private suspend fun resolveAskAiContext(book: BookEntity): AskAiContext {
         val state = _uiState.value
         state.selection?.text
             ?.takeIf(String::isNotBlank)
-            ?.let { return it.take(MAX_ASK_CONTEXT_CHARS) }
+            ?.let { return AskAiContext(it.take(MAX_ASK_CONTEXT_CHARS), isExcerpt = true) }
 
         if (book.format.equals("PDF", ignoreCase = true)) {
             state.pdfPageText
                 .takeIf(String::isNotBlank)
-                ?.let { return it.take(MAX_ASK_CONTEXT_CHARS) }
-            return runCatching {
-                extractPdfPageText(book, state.pdfPageIndex)
-            }.getOrDefault("").take(MAX_ASK_CONTEXT_CHARS)
+                ?.let { return AskAiContext(it.take(MAX_ASK_CONTEXT_CHARS), isExcerpt = true) }
+            return AskAiContext(
+                text = runCatching {
+                    extractPdfPageText(book, state.pdfPageIndex)
+                }.getOrDefault("").take(MAX_ASK_CONTEXT_CHARS),
+                isExcerpt = true,
+            )
         }
 
         val chapters = state.chapters
-        if (chapters.isEmpty()) return ""
+        if (chapters.isEmpty()) return AskAiContext("", isExcerpt = false)
         val chapterIndex = currentEpubChapter.coerceIn(0, chapters.size - 1)
-        return chapters[chapterIndex].text
-            .takeIf(String::isNotBlank)
-            ?.take(MAX_ASK_CONTEXT_CHARS)
-            .orEmpty()
+        return AskAiContext(
+            text = chapters[chapterIndex].text
+                .takeIf(String::isNotBlank)
+                ?.take(MAX_ASK_CONTEXT_CHARS)
+                .orEmpty(),
+            isExcerpt = false,
+        )
     }
+
+    private data class AskAiContext(
+        val text: String,
+        val isExcerpt: Boolean,
+    )
 
     fun extractMinimalistQuote() {
         val selection = _uiState.value.selection ?: return
@@ -1094,6 +1119,53 @@ class ReaderViewModel(
         val book = state.book ?: return
         currentEpubChapter = chapterIndex.coerceAtLeast(0)
         runAiTask(AiTask.SUMMARIZE, chapter.text, book, chapter.title)
+    }
+
+    /**
+     * Entire-book summary: only the title and author are sent. The engine asks
+     * the model's online knowledge and returns a clean message when the book is
+     * unknown, so no chapter text is ever uploaded for this action.
+     */
+    fun summarizeEntireBook() {
+        val book = _uiState.value.book ?: return
+        summarizeEntireBook(book)
+    }
+
+    private fun summarizeEntireBook(book: BookEntity) {
+        if (_uiState.value.isWorking) return
+        setWorking(true)
+        _uiState.value = _uiState.value.copy(aiResult = null)
+        guardedLaunch(Dispatchers.IO) {
+            try {
+                val response = withTimeout(MAX_AI_OPERATION_MS) {
+                    askAiEngine.summarizeEntireBook(
+                        bookTitle = book.title,
+                        author = book.author,
+                        bookId = book.id,
+                    )
+                }.usableAiTextOrNull()
+                    ?: throw IOException("The AI provider returned an empty book summary.")
+                if (_uiState.value.book?.id == book.id) {
+                    _uiState.value = _uiState.value.copy(
+                        aiResult = AiTaskResult("Summary · Entire book", response),
+                    )
+                }
+            } catch (timeout: TimeoutCancellationException) {
+                Log.e(AI_ERROR_TAG, "Execution error", timeout)
+                showAiError(book, "Summary failed", AI_TIMEOUT_MESSAGE)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Log.e(AI_ERROR_TAG, "Execution error", error)
+                showAiError(
+                    book = book,
+                    title = "Summary failed",
+                    message = error.toAiUiMessage("Could not summarize this book."),
+                )
+            } finally {
+                setWorking(false)
+            }
+        }
     }
 
     fun summarizePdfPage(pageIndex: Int) {
@@ -1346,6 +1418,7 @@ class ReaderViewModel(
                     requestAiTaskForLongText(
                         task = task,
                         text = text,
+                        bookId = book.id,
                     )
                 }
                 if (_uiState.value.book?.id == book.id) {
@@ -1464,30 +1537,85 @@ class ReaderViewModel(
     private suspend fun requestAiTaskForLongText(
         task: AiTask,
         text: String,
+        bookId: String,
     ): String {
-        if (task == AiTask.EXTRACT_QUOTE || text.length <= MAX_AI_CHUNK_CHARS) {
-            return requestAiTask(task, text)
+        val cleanText = AiContextSanitizer.sanitize(text)
+        if (cleanText.isBlank()) {
+            throw IOException("There is no readable text to send to the AI assistant.")
         }
-        val chunks = splitAiText(text, MAX_AI_CHUNK_CHARS)
-        val partialResults = chunks.mapIndexed { index, chunk ->
-            requestAiTask(task, chunk).let { result ->
-                if (task == AiTask.SUMMARIZE) "Part ${index + 1}: $result" else result
+        val fullCacheHash = AiResponseCache.hash(task.name, cleanText)
+        aiResponseCache.get(bookId, AiResponseCache.KIND_READER_TASK, fullCacheHash)
+            ?.usableAiTextOrNull()
+            ?.let { return it }
+
+        val result = if (task == AiTask.EXTRACT_QUOTE || cleanText.length <= MAX_AI_CHUNK_CHARS) {
+            requestAiTask(task, cleanText, bookId)
+        } else {
+            val chunks = splitAiText(cleanText, MAX_AI_CHUNK_CHARS)
+            val partialResults = chunks.mapIndexed { index, chunk ->
+                requestAiTask(task, chunk, bookId).let { partial ->
+                    if (task == AiTask.SUMMARIZE) "Part ${index + 1}: $partial" else partial
+                }
+            }
+            if (task == AiTask.SUMMARIZE && partialResults.size > 1) {
+                requestAiTask(
+                    task = AiTask.SUMMARIZE,
+                    selectedText = partialResults.joinToString("\n\n"),
+                    bookId = bookId,
+                )
+            } else {
+                partialResults.joinToString(separator = "\n\n")
             }
         }
-        return if (task == AiTask.SUMMARIZE && partialResults.size > 1) {
-            requestAiTask(AiTask.SUMMARIZE, partialResults.joinToString("\n\n"))
-        } else {
-            partialResults.joinToString(separator = "\n\n")
-        }
+        val usableResult = result.usableAiTextOrNull()
+            ?: throw IOException("The AI provider returned an empty ${task.title.lowercase()}.")
+        aiResponseCache.put(
+            bookId = bookId,
+            cacheKind = AiResponseCache.KIND_READER_TASK,
+            queryHash = fullCacheHash,
+            content = usableResult,
+        )
+        return usableResult
     }
 
     /**
      * Runs one chunk through [AskAiEngine], which resolves the provider/key/model
      * failover pool on every request and transparently tries the next saved
      * provider on 401/429/network errors before surfacing a single UI error.
+     *
+     * Repeated summaries of the same page/chapter/selection are served from
+     * Room, so they consume zero provider tokens.
      */
-    private suspend fun requestAiTask(task: AiTask, selectedText: String): String =
-        askAiEngine.runTask(task.toReaderTask(), selectedText)
+    private suspend fun requestAiTask(
+        task: AiTask,
+        selectedText: String,
+        bookId: String,
+    ): String {
+        val cleanText = AiContextSanitizer.sanitize(selectedText)
+        if (cleanText.isBlank()) {
+            throw IOException("There is no readable text to send to the AI assistant.")
+        }
+        val cacheHash = AiResponseCache.hash(task.name, cleanText)
+        aiResponseCache.get(bookId, AiResponseCache.KIND_READER_TASK, cacheHash)
+            ?.usableAiTextOrNull()
+            ?.let { return it }
+        val response = askAiEngine.runTask(task.toReaderTask(), cleanText)
+            .usableAiTextOrNull()
+            ?: throw IOException("The AI provider returned an empty ${task.title.lowercase()}.")
+        aiResponseCache.put(
+            bookId = bookId,
+            cacheKind = AiResponseCache.KIND_READER_TASK,
+            queryHash = cacheHash,
+            content = response,
+        )
+        return response
+    }
+
+    private fun String.usableAiTextOrNull(): String? = trim().takeIf {
+        it.isNotEmpty() &&
+            !it.equals("null", ignoreCase = true) &&
+            !it.equals("undefined", ignoreCase = true)
+    }
 
     private fun AiTask.toReaderTask(): AskAiEngine.Task = when (this) {
         AiTask.SUMMARIZE -> AskAiEngine.Task.SUMMARIZE

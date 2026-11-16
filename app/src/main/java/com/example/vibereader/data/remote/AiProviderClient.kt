@@ -16,6 +16,8 @@ import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.SocketTimeoutException
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -34,8 +36,21 @@ object AiProviderClient {
     private const val MAX_ERROR_BODY_CHARS = 300
     private const val ANTHROPIC_VERSION = "2023-06-01"
     private const val DEFAULT_ANTHROPIC_MAX_TOKENS = 4096
+    private const val MAX_JSON_TEXT_DEPTH = 4
+    private val CONTENT_TEXT_FIELDS = listOf("text", "content")
+    private val THINK_BLOCK = Regex(
+        "<think\\b[^>]*>.*?</think\\s*>",
+        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+    )
+    private val THINK_UNCLOSED = Regex(
+        "<think\\b[^>]*>.*",
+        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+    )
+    private val THINK_TAG = Regex("</?think\\b[^>]*>", RegexOption.IGNORE_CASE)
     private const val APP_REFERER = "https://github.com/VibeReader"
     private const val APP_TITLE = "VibeReader"
+    private val OPENCODE_MODEL_PREFIX =
+        Regex("^(?:opencode/)+", RegexOption.IGNORE_CASE)
 
     suspend fun executeChat(
         client: OkHttpClient,
@@ -47,10 +62,12 @@ object AiProviderClient {
         maxTokens: Int? = null,
         temperature: Double = 0.3,
     ): String = withContext(Dispatchers.IO) {
+        val normalizedModel = normalizeModelId(provider, model)
+        val normalizedKey = apiKey.trim()
         val payload = if (provider.usesAnthropicMessagesApi) {
             buildAnthropicPayload(
                 provider,
-                model,
+                normalizedModel,
                 systemPrompt,
                 userContent,
                 maxTokens,
@@ -59,7 +76,7 @@ object AiProviderClient {
         } else {
             buildOpenAiCompatiblePayload(
                 provider,
-                model,
+                normalizedModel,
                 systemPrompt,
                 userContent,
                 maxTokens,
@@ -68,7 +85,7 @@ object AiProviderClient {
         }
         val request = Request.Builder()
             .url(provider.chatCompletionsUrl)
-            .applyProviderAuth(provider, apiKey)
+            .applyProviderAuth(provider, normalizedKey)
             .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
             .build()
 
@@ -85,10 +102,22 @@ object AiProviderClient {
                         TAG,
                         "API HTTP Error: ${activeResponse.code} - ${body.take(MAX_ERROR_BODY_CHARS)}",
                     )
+                    val serverMessage = extractServerErrorMessage(body)
                     throw AiProviderHttpException(
                         statusCode = activeResponse.code,
-                        message = "${provider.displayName} returned HTTP ${activeResponse.code}: " +
-                            body.take(MAX_ERROR_BODY_CHARS),
+                        serverMessage = serverMessage,
+                        message = buildString {
+                            append(provider.displayName)
+                            append(" returned HTTP ")
+                            append(activeResponse.code)
+                            val detail = serverMessage
+                                ?: body.take(MAX_ERROR_BODY_CHARS)
+                                    .takeIf(String::isNotBlank)
+                            if (detail != null) {
+                                append(": ")
+                                append(detail)
+                            }
+                        },
                     )
                 }
                 parseChatResponse(provider, body)
@@ -96,6 +125,14 @@ object AiProviderClient {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: AiProviderHttpException) {
+            throw error
+        } catch (error: SocketTimeoutException) {
+            // Preserve the concrete timeout type for timeout-aware failover.
+            Log.e(TAG, "Network timeout", error)
+            throw error
+        } catch (error: InterruptedIOException) {
+            // Includes OkHttp callTimeout and other interrupted reads.
+            Log.e(TAG, "Network interrupted/timeout", error)
             throw error
         } catch (error: IOException) {
             Log.e(TAG, "Network/IO Error", error)
@@ -194,6 +231,19 @@ object AiProviderClient {
             )
     }
 
+    /**
+     * OpenCode's OpenAI-compatible endpoint is already scoped to its gateway.
+     * A model copied from CLI configuration may still carry an `opencode/`
+     * prefix, which the REST endpoint rejects as an unknown model ID.
+     */
+    fun normalizeModelId(provider: AiProvider, model: String): String {
+        val trimmed = model.trim()
+        if (provider != AiProvider.OPENCODE) return trimmed
+        return trimmed
+            .replaceFirst(OPENCODE_MODEL_PREFIX, "")
+            .trim()
+    }
+
     private fun Request.Builder.applyProviderAuth(
         provider: AiProvider,
         apiKey: String,
@@ -210,37 +260,141 @@ object AiProviderClient {
                 header("X-Title", APP_TITLE)
             }
 
+            AiProvider.OPENCODE -> {
+                header("Authorization", "Bearer $apiKey")
+                header("Content-Type", "application/json")
+                header("Accept", "application/json")
+            }
+
             else -> header("Authorization", "Bearer $apiKey")
         }
     }
 
+    /**
+     * OpenAI-compatible gateways wrap the actionable text in different JSON
+     * envelopes (`error.message`, `message`, `detail`, or a plain `error`
+     * string). Extracting it lets a single-key failure surface exactly what the
+     * provider said instead of a generic quota message.
+     */
+    private fun extractServerErrorMessage(body: String): String? {
+        val trimmed = body.trim()
+        if (trimmed.isEmpty()) return null
+        val extracted = runCatching {
+            val json = JSONObject(trimmed)
+            val error = json.opt("error")
+            val nested = when (error) {
+                is JSONObject -> sequenceOf("message", "detail", "type", "code")
+                    .mapNotNull { key ->
+                        error.optString(key).trim().takeIf(String::isNotBlank)
+                    }
+                    .firstOrNull()
+
+                is String -> error.trim().takeIf(String::isNotBlank)
+                else -> null
+            }
+            nested
+                ?: sequenceOf("message", "detail")
+                    .mapNotNull { key ->
+                        json.optString(key).trim().takeIf(String::isNotBlank)
+                    }
+                    .firstOrNull()
+        }.getOrNull()
+        return extracted
+            ?.take(MAX_ERROR_BODY_CHARS)
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+    }
+
     private fun parseChatResponse(provider: AiProvider, body: String): String {
         val text = if (provider.usesAnthropicMessagesApi) {
-            val content = JSONObject(body).optJSONArray("content")
+            // Only text content blocks are user-visible output. Thinking /
+            // reasoning blocks must never leak into answers or quotes.
+            val root = JSONObject(body)
+            contentText(root.opt("content"))
+                ?: throw IOException(
+                    "${provider.displayName} returned an empty response " +
+                        "(no text content).",
+                )
+        } else {
+            val choices = JSONObject(body).optJSONArray("choices")
                 ?: throw IOException("${provider.displayName} returned an invalid response.")
-            buildString {
-                for (index in 0 until content.length()) {
-                    val block = content.optJSONObject(index) ?: continue
-                    if (block.optString("type") == "text") {
-                        append(block.optString("text"))
+            val choice = choices.optJSONObject(0)
+                ?: throw IOException("${provider.displayName} returned no choices.")
+            val message = choice.optJSONObject("message")
+            // Exactly message.content: never fall back to reasoning or
+            // reasoning_content. Those fields are internal thinking text and
+            // used to leak into the UI and the quotes list.
+            val content = contentText(message?.opt("content"))
+            content ?: throw IOException(
+                buildString {
+                    append(provider.displayName)
+                    append(" returned an empty response")
+                    val finishReason = choice.optString("finish_reason")
+                        .takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+                    if (finishReason != null) {
+                        append(" (finish_reason=")
+                        append(finishReason)
+                        append(')')
                     }
+                    append(". The model produced no message content; ")
+                    append("try a different model or increase max tokens.")
+                },
+            )
+        }
+        return text.trim().takeIf { it.isNotBlank() }
+            ?: throw IOException("${provider.displayName} returned only blank text.")
+    }
+
+    /**
+     * Extracts only visible `content` text. JSON `null`, [JSONObject.NULL], and
+     * the literal strings `"null"`/`"undefined"` are rejected. Content arrays
+     * are accepted for providers that return text blocks, but thinking,
+     * reasoning, and non-text blocks are ignored.
+     */
+    private fun contentText(value: Any?, depth: Int = 0): String? {
+        if (value == null || value == JSONObject.NULL || depth > MAX_JSON_TEXT_DEPTH) return null
+        return when (value) {
+            is String -> cleanedModelText(value)
+
+            is JSONArray -> (0 until value.length())
+                .asSequence()
+                .mapNotNull { index -> contentText(value.opt(index), depth + 1) }
+                .joinToString("\n")
+                .takeIf(String::isNotBlank)
+
+            is JSONObject -> {
+                val type = value.optString("type")
+                if (type.isNotBlank() && !type.equals("text", ignoreCase = true)) {
+                    null
+                } else {
+                    CONTENT_TEXT_FIELDS
+                        .asSequence()
+                        .mapNotNull { field -> contentText(value.opt(field), depth + 1) }
+                        .firstOrNull()
                 }
             }
-        } else {
-            JSONObject(body)
-                .getJSONArray("choices")
-                .getJSONObject(0)
-                .getJSONObject("message")
-                .optString("content")
+
+            else -> cleanedModelText(value.toString())
         }
-        return text.trim().takeIf(String::isNotBlank)
-            ?: throw IOException("AI provider returned an empty response.")
     }
+
+    private fun cleanedModelText(raw: String): String? = raw
+        .replace(THINK_BLOCK, " ")
+        .replace(THINK_UNCLOSED, " ")
+        .replace(THINK_TAG, " ")
+        .trim()
+        .takeIf {
+            it.isNotEmpty() &&
+                !it.equals("null", ignoreCase = true) &&
+                !it.equals("undefined", ignoreCase = true)
+        }
 }
 
 class AiProviderHttpException(
     val statusCode: Int,
     message: String,
+    /** Actionable message extracted from the provider's error JSON, if any. */
+    val serverMessage: String? = null,
 ) : IOException(message) {
     /**
      * Any HTTP failure should be retried against the next configured provider:

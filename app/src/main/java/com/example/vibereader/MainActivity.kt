@@ -19,12 +19,16 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
@@ -49,6 +53,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
@@ -140,16 +145,19 @@ private fun VibeReaderRoot() {
         initialValue = ThemeOption.SYSTEM,
     )
     val systemDarkTheme = isSystemInDarkTheme()
+    // The exact status/navigation icon polarity used on first launch and after
+    // every theme change. Restoring this value (instead of a hardcoded one)
+    // keeps the reader exit identical to the app's normal main-screen chrome.
+    val lightSystemBars = when (currentTheme) {
+        ThemeOption.OLED_BLACK -> false
+        ThemeOption.SEPIA, ThemeOption.LIGHT -> true
+        ThemeOption.SYSTEM -> !systemDarkTheme
+    }
 
     VibeReaderTheme(themeOption = currentTheme) {
         SideEffect {
             window?.let { window ->
                 val controller = WindowCompat.getInsetsController(window, view)
-                val lightSystemBars = when (currentTheme) {
-                    ThemeOption.OLED_BLACK -> false
-                    ThemeOption.SEPIA, ThemeOption.LIGHT -> true
-                    ThemeOption.SYSTEM -> !systemDarkTheme
-                }
                 controller.isAppearanceLightStatusBars = lightSystemBars
                 controller.isAppearanceLightNavigationBars = lightSystemBars
             }
@@ -164,6 +172,7 @@ private fun VibeReaderRoot() {
             VibeReaderApp(
                 settingsViewModel = settingsViewModel,
                 storageAccessReady = storageAccessReady,
+                lightSystemBars = lightSystemBars,
             )
         }
     }
@@ -186,6 +195,7 @@ private val destinations = listOf(
 private fun VibeReaderApp(
     settingsViewModel: SettingsViewModel,
     storageAccessReady: Boolean,
+    lightSystemBars: Boolean,
 ) {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
@@ -195,22 +205,35 @@ private fun VibeReaderApp(
     val view = LocalView.current
     val window = remember(context) { (context as? Activity)?.window }
 
-    // ReaderScreen switches the window to decor-fitting while it owns the
-    // screen. Restore edge-to-edge as soon as the reader leaves, otherwise the
-    // NavigationBar is laid out above the system navigation area and leaves a
-    // blank strip below it.
-    LaunchedEffect(isReader) {
-        val activityWindow = window ?: return@LaunchedEffect
+    // ReaderScreen switches the window to decor-fitting and can leave the
+    // navigation-bar behavior in transient-swipe mode. SideEffect runs after
+    // composition (including the reader's DisposableEffect cleanup), so the
+    // main tabs always return to the exact launch chrome: edge-to-edge, bars
+    // visible, default behavior, and the theme's icon polarity. With
+    // decor-fitting restored, CompactNavigationBar's single
+    // navigationBarsPadding() is the only bottom inset and cannot stack an
+    // extra ~48dp strip above the system navigation area.
+    SideEffect {
+        val activityWindow = window ?: return@SideEffect
         if (!isReader) {
             WindowCompat.setDecorFitsSystemWindows(activityWindow, false)
-            WindowCompat.getInsetsController(activityWindow, view).show(
-                WindowInsetsCompat.Type.systemBars(),
-            )
+            WindowCompat.getInsetsController(activityWindow, view).apply {
+                show(WindowInsetsCompat.Type.systemBars())
+                systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+                isAppearanceLightStatusBars = lightSystemBars
+                isAppearanceLightNavigationBars = lightSystemBars
+            }
         }
     }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
+        // Bottom inset is owned only by CompactNavigationBar's
+        // navigationBarsPadding(). Excluding it here prevents the Scaffold
+        // from adding a second one when the reader restores edge-to-edge.
+        contentWindowInsets = WindowInsets.systemBars.only(
+            WindowInsetsSides.Top + WindowInsetsSides.Horizontal,
+        ),
         bottomBar = {
             if (!isReader) {
                 CompactNavigationBar(

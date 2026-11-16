@@ -1,18 +1,25 @@
 package com.example.vibereader.data.repository
 
 import android.util.Log
+import com.example.vibereader.BuildConfig
 import com.example.vibereader.data.local.AiKeyVault
 import com.example.vibereader.data.remote.AiProviderClient
 import com.example.vibereader.data.remote.AiProviderHttpException
+import com.example.vibereader.data.remote.OpenCodeModelPolicy
 import com.example.vibereader.model.AiProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.SocketTimeoutException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * One fully resolved provider request.
@@ -92,6 +99,38 @@ data class AiValidatedCompletion<T>(
 )
 
 /**
+ * Gemini keys supplied at build time through the git-ignored
+ * `local.properties` file:
+ *
+ * ```
+ * GEMINI_API_KEYS=key-one,key-two,key-three
+ * ```
+ *
+ * Gradle turns the comma-separated value into `BuildConfig.GEMINI_API_KEYS`.
+ * Whitespace and surrounding quotes are stripped here as a second line of
+ * defence, and placeholders/duplicates are removed. The list is never null;
+ * an unconfigured build simply exposes an empty pool.
+ */
+internal object GeminiBuildTimeKeys {
+    private const val PLACEHOLDER = "your_key_here"
+
+    val keys: List<String> = BuildConfig.GEMINI_API_KEYS
+        .orEmpty()
+        .asSequence()
+        .map { it.trim().trim('"', '\'').trim() }
+        .filter { it.isNotEmpty() && it != PLACEHOLDER }
+        .distinct()
+        .toList()
+}
+
+/** Stable in-memory identity used by cooldown/blacklist maps. Never logged. */
+private fun ResolvedAiRequest.keyIdentity(): String = "${provider.name}:$apiKey"
+
+/** Non-reversible-enough diagnostic label for cooldown logs. Never logs the key. */
+private fun ResolvedAiRequest.keyFingerprint(): String =
+    "${provider.name}:#${apiKey.hashCode().toUInt().toString(16)}"
+
+/**
  * Resolves every usable entry in the user's API-key/failover pool.
  *
  * The selected provider is always first. OpenRouter, OpenCode, Gemini and
@@ -101,9 +140,14 @@ data class AiValidatedCompletion<T>(
  * `SELECTED_GEMINI_MODEL`, a failover to OpenCode uses
  * `SELECTED_OPENCODE_MODEL`, and so on.
  *
- * A provider with a missing key or a missing saved model is logged and skipped;
- * it is never called with a blank model. If no provider has both values, the
- * request fails immediately with [SETUP_ERROR_MESSAGE] before any network call.
+ * Gemini can contribute more than one key: the saved key (or legacy
+ * `GEMINI_API_KEY`) plus every entry in the build-time `GEMINI_API_KEYS`
+ * array. Duplicate key strings are removed. When build-time keys exist but no
+ * Gemini model has been saved yet, the provider default model is used so the
+ * pool works on a fresh install. A provider with no key or no usable model is
+ * logged and skipped; it is never called with a blank model. If no
+ * provider/key has both values, the request fails immediately with
+ * [SETUP_ERROR_MESSAGE] before any network call.
  */
 object AiRuntimeResolver {
     /**
@@ -133,42 +177,94 @@ object AiRuntimeResolver {
 
     fun resolve(keyVault: AiKeyVault): List<ResolvedAiRequest> {
         val activeProvider = keyVault.getSelectedProvider()
-        val resolved = linkedMapOf<AiProvider, ResolvedAiRequest>()
+        val resolved = mutableListOf<ResolvedAiRequest>()
+        val seenKeys = mutableSetOf<String>()
 
         fun tryAdd(provider: AiProvider, isActive: Boolean) {
             val config = keyVault.getProviderConfig(provider)
-            val apiKey = config.apiKey.trim()
-            val model = keyVault.getAiModel(provider)
-                ?.trim()
-                .orEmpty()
+            val buildTimeKeys =
+                if (provider == AiProvider.GEMINI) GeminiBuildTimeKeys.keys else emptyList()
+            val savedModel = AiProviderClient.normalizeModelId(
+                provider,
+                keyVault.getAiModel(provider).orEmpty(),
+            )
+            // CLI/client-restricted OpenCode models must never reach the REST
+            // endpoint, even if an older build persisted one as the active
+            // model. Fall back to the provider's REST-safe default instead.
+            // A build-time Gemini pool (including the legacy single-key
+            // fallback) must also work without a Settings visit. Providers
+            // without build-time keys still require an explicitly saved model.
+            val model = when {
+                provider == AiProvider.OPENCODE &&
+                    OpenCodeModelPolicy.isRestrictedModel(savedModel) -> {
+                    Log.w(
+                        TAG,
+                        "Saved OpenCode model '$savedModel' is CLI/client-restricted; " +
+                            "using '${provider.defaultModel}' for REST inference.",
+                    )
+                    AiProviderClient.normalizeModelId(provider, provider.defaultModel)
+                        .takeUnless { OpenCodeModelPolicy.isRestrictedModel(it) }
+                        .orEmpty()
+                }
+
+                savedModel.isNotBlank() -> savedModel
+
+                buildTimeKeys.isNotEmpty() ->
+                    AiProviderClient.normalizeModelId(provider, provider.defaultModel)
+
+                else -> ""
+            }
             val enabled = isActive || config.isEnabled
 
             if (!enabled) {
                 Log.d(TAG, "Skipping ${provider.shortLabel}: provider is disabled.")
                 return
             }
-            if (apiKey.isBlank() || model.isBlank()) {
+            if (model.isBlank()) {
                 Log.w(
                     TAG,
-                    "Skipping ${provider.shortLabel}: " +
-                        "keyPresent=${apiKey.isNotBlank()}, " +
-                        "modelPresent=${model.isNotBlank()} " +
+                    "Skipping ${provider.shortLabel}: model is not selected " +
                         "(expected ${modelPreferenceKey(provider)}).",
                 )
                 return
             }
 
-            resolved[provider] = ResolvedAiRequest(
-                provider = provider,
-                apiKey = apiKey,
-                model = model,
-                modelSource = AiModelSource.SAVED,
-                modelPreferenceKey = modelPreferenceKey(provider),
-            )
+            // The saved key wins for the single-key slot. Gemini additionally
+            // contributes every build-time key from local.properties.
+            val keys = buildList {
+                add(config.apiKey)
+                addAll(buildTimeKeys)
+            }
+                .asSequence()
+                .map { it.trim().trim('"', '\'').trim() }
+                .filter(String::isNotBlank)
+                .distinct()
+                .toList()
+
+            if (keys.isEmpty()) {
+                Log.w(
+                    TAG,
+                    "Skipping ${provider.shortLabel}: no API key is configured.",
+                )
+                return
+            }
+
+            keys.forEach { apiKey ->
+                val request = ResolvedAiRequest(
+                    provider = provider,
+                    apiKey = apiKey,
+                    model = model,
+                    modelSource = AiModelSource.SAVED,
+                    modelPreferenceKey = modelPreferenceKey(provider),
+                )
+                if (seenKeys.add(request.keyIdentity())) {
+                    resolved += request
+                }
+            }
             Log.d(
                 TAG,
-                "Resolved ${provider.shortLabel}: key=${modelPreferenceKey(provider)}, " +
-                    "model=$model, active=${provider == activeProvider}",
+                "Resolved ${provider.shortLabel}: keys=${keys.size}, model=$model, " +
+                    "active=${provider == activeProvider}",
             )
         }
 
@@ -187,7 +283,7 @@ object AiRuntimeResolver {
             Log.e(AI_ERROR_TAG, "Execution error", error)
             throw error
         }
-        return resolved.values.toList()
+        return resolved
     }
 
     fun resolveActive(keyVault: AiKeyVault): ResolvedAiRequest = resolve(keyVault).first()
@@ -256,24 +352,34 @@ object AiRuntimeResolver {
 }
 
 /**
- * Automatic API-key/provider failover for both the Book Assistant and the
- * wallpaper quote fetcher.
+ * Automatic API-key/provider failover for every AI path in the app.
  *
- * Every request resolves the full provider pool on each invocation, starts with
- * the selected provider, and immediately retries the next provider on HTTP
- * 401/403/404/429, any other HTTP failure, a network exception, a timeout, or
- * an unexpected runtime error. [completeValidated] additionally treats a
- * response that fails caller-side validation (for example, no usable quotes)
- * as an attempt failure and advances to the next provider. The model used for
- * each attempt is the exact model saved for that provider, so switching
- * providers never reuses another provider's model ID.
+ * Key rotation and health:
+ * - Every request resolves the full provider/key pool, then starts at the next
+ *   entry selected by an [AtomicInteger] round-robin cursor. With Gemini's
+ *   build-time pool this gives `key 0 -> key 1 -> key 2 -> key 0` ordering
+ *   instead of hammering the first key.
+ * - HTTP 429 places only that key on a 60-second [keyCooldowns] entry and the
+ *   request immediately advances to the next key. Cooldowns are purged
+ *   automatically when they expire, so no app restart is required.
+ * - HTTP 401/403 permanently disables that key for the process session
+ *   ([disabledKeys]); it is never selected again until the app restarts.
+ * - Timeouts ([SocketTimeoutException] / [InterruptedIOException]) mark the
+ *   stalled provider as temporarily busy and fail over immediately to the next
+ *   provider/key. Other network IO failures and 5xx responses get up to two
+ *   exponential backoff retries on the same key before the sweep moves on.
+ *   Validation failures (for example an unusable quote payload) advance
+ *   immediately.
+ * - If every remaining key is on a 429 cooldown, the manager waits for the
+ *   earliest expiry and retries rather than surfacing an "all keys failed"
+ *   error. [ALL_KEYS_FAILED_MESSAGE] is reserved for a pool where every key is
+ *   disabled, has failed, or the device is offline.
  *
- * The UI only receives a failure after every key/provider in the pool has been
- * exhausted. A failed sweep is terminal: this manager throws one
- * [AiRequestException] and never retries the pool internally, so callers can
- * stop their background loop instead of hammering the same failing keys.
- * A single hard timeout prevents the "Working…" state from hanging when
- * several providers each take a long time to fail.
+ * [completeValidated] treats a response that fails caller-side validation as
+ * an attempt failure. The model used for each attempt is the saved model for
+ * that provider (or its REST-safe default), so switching providers never
+ * reuses another provider's model ID. A single hard timeout prevents the
+ * "Working…" state from hanging.
  */
 object AiFailoverManager {
     private const val TAG = "AiFailoverManager"
@@ -288,6 +394,43 @@ object AiFailoverManager {
 
     /** Exact user-facing message when every saved key/provider has failed. */
     const val ALL_KEYS_FAILED_MESSAGE = "All API keys failed or out of quota."
+
+    /** 429 keys rest for this long before rejoining the rotation. */
+    private const val RATE_LIMIT_COOLDOWN_MILLIS = 60_000L
+
+    /** 5xx/network failures are retried this many times on the same key. */
+    private const val MAX_TRANSIENT_RETRIES = 2
+
+    private const val BASE_BACKOFF_MILLIS = 500L
+
+    /** A timed-out provider is deprioritized for this long, then restored. */
+    private const val TIMEOUT_BUSY_MILLIS = 30_000L
+
+    /**
+     * Key identity -> epoch millis at which the key becomes usable again.
+     * Entries are removed automatically once their cooldown expires.
+     */
+    private val keyCooldowns = ConcurrentHashMap<String, Long>()
+
+    /**
+     * Provider name -> epoch millis until which its requests are considered
+     * stalled. Timed-out providers move to the end of the failover order
+     * temporarily so healthy providers are preferred, then rejoin automatically.
+     */
+    private val providerBusyUntil = ConcurrentHashMap<String, Long>()
+
+    /** Keys disabled for the whole app session after HTTP 401/403. */
+    private val disabledKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /**
+     * Last failure observed for each key. A single key that is skipped while
+     * cooling down or disabled still reports its exact HTTP/timeout reason on
+     * the next request instead of falling back to the generic quota message.
+     */
+    private val keyFailureReasons = ConcurrentHashMap<String, Throwable>()
+
+    /** Rotates the starting key for every new request. */
+    private val roundRobinIndex = AtomicInteger(0)
 
     suspend fun complete(
         keyVault: AiKeyVault,
@@ -318,10 +461,10 @@ object AiFailoverManager {
     }
 
     /**
-     * Runs the same sequential provider/key sweep as [complete], but every
+     * Runs the same rotating key/provider sweep as [complete], but every
      * response must pass [validate] before it is accepted. A parsing failure,
      * empty result, or any other validation exception counts as an attempt
-     * failure, so the next provider/key in the sequence is tried immediately.
+     * failure, so the next key/provider in the sequence is tried immediately.
      *
      * This is what lets quote fetching fail over when a provider returns HTTP
      * 200 with unusable text instead of stopping at the first provider.
@@ -345,28 +488,91 @@ object AiFailoverManager {
             Log.e(AI_ERROR_TAG, "Execution error", error)
             throw error
         }
-        // Hard ceiling for one request attempt. The app stores one key per
-        // provider (seven providers today), so this allows the full pool while
-        // capping runaway growth if more providers/keys are added later.
+        // Hard ceiling for one request attempt. The pool normally contains one
+        // key per provider plus the Gemini build-time rotation keys.
         val attempts = configs.take(MAX_FAILOVER_ATTEMPTS)
 
         Log.d(
             TAG,
-            "Failover pool (${attempts.size}): " +
+            "Failover pool (${attempts.size} key(s)): " +
                 attempts.joinToString { "${it.provider.shortLabel}:${it.model}" },
         )
 
         val boundedTimeout = overallTimeoutMillis.coerceAtLeast(1_000L)
         val completion = withTimeoutOrNull(boundedTimeout) {
-            var lastError: Throwable? = null
+            executeFailoverSweep(
+                attempts = attempts,
+                httpClient = httpClient,
+                systemPrompt = systemPrompt,
+                userContent = userContent,
+                maxTokens = maxTokens,
+                temperature = temperature,
+                logTag = logTag,
+                validate = validate,
+            )
+        }
 
-            for ((index, config) in attempts.withIndex()) {
-                // Stop immediately if the caller cancelled while a previous
-                // provider was failing; never start another request after a
-                // cancelled/finished fetch session.
+        completion ?: run {
+            val timeoutError = AiRequestException(
+                message = "The AI request timed out. Check your internet connection " +
+                    "and try again.",
+                stopBackgroundFetch = true,
+            )
+            Log.e(AI_ERROR_TAG, "Execution error", timeoutError)
+            Log.e(
+                logTag,
+                "AI request exceeded the overall timeout of ${boundedTimeout}ms " +
+                    "with ${attempts.size} key(s) in the pool.",
+            )
+            throw timeoutError
+        }
+    }
+
+    /**
+     * Sweeps the pool in round-robin order. Healthy keys are attempted once per
+     * request; 429 keys are parked for [RATE_LIMIT_COOLDOWN_MILLIS] and may be
+     * retried once their cooldown expires. 401/403 keys are disabled for the
+     * session. Transient failures are retried on the same key before advancing.
+     */
+    private suspend fun <T> executeFailoverSweep(
+        attempts: List<ResolvedAiRequest>,
+        httpClient: OkHttpClient,
+        systemPrompt: String,
+        userContent: String,
+        maxTokens: Int?,
+        temperature: Double,
+        logTag: String,
+        validate: (String) -> T,
+    ): AiValidatedCompletion<T> {
+        var lastError: Throwable? = null
+        val triedKeys = mutableSetOf<String>()
+        val rateLimitedKeys = mutableSetOf<String>()
+        val timedOutProviders = mutableSetOf<AiProvider>()
+
+        while (true) {
+            // Cooldowns that expired since the previous pass are restored to
+            // the active pool before the next selection.
+            purgeExpiredCooldowns()
+            purgeExpiredProviderBusy()
+            // Recently timed-out providers are still tried if every healthy
+            // provider fails, but they no longer lead the fallback order.
+            val ordered = roundRobinOrder(attempts)
+                .sortedBy { if (isProviderTemporarilyBusy(it.provider)) 1 else 0 }
+
+            for ((index, config) in ordered.withIndex()) {
                 currentCoroutineContext().ensureActive()
+                if (config.provider in timedOutProviders) continue
+                val identity = config.keyIdentity()
+                if (identity in disabledKeys) continue
+                if (isCoolingDown(identity)) continue
+                if (identity in triedKeys && identity !in rateLimitedKeys) continue
+
+                // A key that just came off cooldown is allowed one fresh pass.
+                rateLimitedKeys.remove(identity)
+                triedKeys += identity
+
                 try {
-                    val (text, usedModel) = executeProvider(
+                    val (text, usedModel) = executeProviderWithRetries(
                         httpClient = httpClient,
                         config = config,
                         systemPrompt = systemPrompt,
@@ -384,13 +590,14 @@ object AiFailoverManager {
                         throw cancelled
                     } catch (validationError: Throwable) {
                         lastError = validationError
+                        keyFailureReasons[identity] = validationError
                         Log.e(AI_ERROR_TAG, "Execution error", validationError)
                         Log.e(
                             logTag,
                             "AI response validation failed on " +
                                 "${config.provider.displayName} " +
                                 "(model=$usedModel) [${index + 1}/${attempts.size}]; " +
-                                "trying next provider.",
+                                "trying next key.",
                             validationError,
                         )
                         currentCoroutineContext().ensureActive()
@@ -399,50 +606,269 @@ object AiFailoverManager {
 
                     Log.d(
                         TAG,
-                        "Provider ${config.provider.shortLabel} succeeded with " +
-                            "model=$usedModel [${index + 1}/${attempts.size}].",
+                        "Key ${config.keyFingerprint()} succeeded with " +
+                            "provider=${config.provider.shortLabel}, model=$usedModel " +
+                            "[${index + 1}/${attempts.size}].",
                     )
-                    return@withTimeoutOrNull AiValidatedCompletion(
+                    keyFailureReasons.remove(identity)
+                    return AiValidatedCompletion(
                         value = value,
                         provider = config.provider,
                         model = usedModel,
                     )
                 } catch (cancelled: CancellationException) {
                     throw cancelled
+                } catch (timeout: SocketTimeoutException) {
+                    lastError = timeout
+                    keyFailureReasons[identity] = timeout
+                    markProviderTemporarilyBusy(config.provider)
+                    timedOutProviders += config.provider
+                    Log.e(AI_ERROR_TAG, "Execution error", timeout)
+                    Log.w(
+                        logTag,
+                        "Timeout on ${config.provider.displayName} " +
+                            "(model=${config.model}, key=${config.keyFingerprint()}) " +
+                            "[${index + 1}/${attempts.size}]; marked temporarily busy " +
+                            "for ${TIMEOUT_BUSY_MILLIS}ms and failing over to the next " +
+                            "provider/key.",
+                        timeout,
+                    )
+                    currentCoroutineContext().ensureActive()
+                } catch (timeout: InterruptedIOException) {
+                    lastError = timeout
+                    keyFailureReasons[identity] = timeout
+                    markProviderTemporarilyBusy(config.provider)
+                    timedOutProviders += config.provider
+                    Log.e(AI_ERROR_TAG, "Execution error", timeout)
+                    Log.w(
+                        logTag,
+                        "Network interruption/timeout on ${config.provider.displayName} " +
+                            "(model=${config.model}, key=${config.keyFingerprint()}) " +
+                            "[${index + 1}/${attempts.size}]; marked temporarily busy " +
+                            "for ${TIMEOUT_BUSY_MILLIS}ms and failing over to the next " +
+                            "provider/key.",
+                        timeout,
+                    )
+                    currentCoroutineContext().ensureActive()
+                } catch (error: AiProviderHttpException) {
+                    lastError = error
+                    keyFailureReasons[identity] = error
+                    when (error.statusCode) {
+                        429 -> {
+                            keyCooldowns[identity] = System.currentTimeMillis() +
+                                RATE_LIMIT_COOLDOWN_MILLIS
+                            rateLimitedKeys += identity
+                            Log.w(
+                                logTag,
+                                "Rate limit (HTTP 429) on ${config.keyFingerprint()}; " +
+                                    "cooling down for ${RATE_LIMIT_COOLDOWN_MILLIS}ms " +
+                                    "and trying the next key.",
+                            )
+                        }
+
+                        401, 403 -> {
+                            disabledKeys += identity
+                            Log.w(
+                                logTag,
+                                "Authentication failure (HTTP ${error.statusCode}) on " +
+                                    "${config.keyFingerprint()}; key disabled for this " +
+                                    "app session.",
+                            )
+                        }
+
+                        else -> Log.e(
+                            logTag,
+                            "AI request failed on ${config.provider.displayName} " +
+                                "(model=${config.model}, key=${config.keyFingerprint()}) " +
+                                "[${index + 1}/${attempts.size}]; trying next key.",
+                            error,
+                        )
+                    }
+                    Log.e(AI_ERROR_TAG, "Execution error", error)
+                    // Honour cancellation before advancing to the next key.
+                    currentCoroutineContext().ensureActive()
                 } catch (error: Throwable) {
                     lastError = error
-                    // Exact required trace for every failed attempt. The next
-                    // provider/key in the pool is tried immediately after this.
+                    keyFailureReasons[identity] = error
                     Log.e(AI_ERROR_TAG, "Execution error", error)
                     Log.e(
                         logTag,
                         "AI request failed on ${config.provider.displayName} " +
-                            "(model=${config.model}, key=${config.modelPreferenceKey}) " +
-                            "[${index + 1}/${attempts.size}]; trying next provider.",
+                            "(model=${config.model}, key=${config.keyFingerprint()}) " +
+                            "[${index + 1}/${attempts.size}]; trying next key.",
                         error,
                     )
-                    // Honour cancellation before advancing to the next key.
                     currentCoroutineContext().ensureActive()
                 }
             }
 
-            throw buildExhaustedException(attempts, lastError)
-        }
+            // Every currently usable key was tried. If some keys are merely
+            // rate-limited, wait for the earliest cooldown instead of reporting
+            // a terminal "all keys failed" error.
+            val now = System.currentTimeMillis()
+            purgeExpiredCooldowns()
+            val earliestCooldown = attempts
+                .asSequence()
+                .filter { it.keyIdentity() !in disabledKeys }
+                .mapNotNull { keyCooldowns[it.keyIdentity()] }
+                .filter { it > now }
+                .minOrNull()
+            if (earliestCooldown != null) {
+                if (attempts.size == 1) {
+                    // A single key cannot rotate anywhere else. Surface its
+                    // exact HTTP error immediately instead of hiding it behind
+                    // a 60-second cooldown and then a generic quota message.
+                    throw buildExhaustedException(
+                        attempts,
+                        lastError ?: rememberedFailure(attempts),
+                    )
+                }
+                val waitMillis = (earliestCooldown - now)
+                    .coerceAtMost(RATE_LIMIT_COOLDOWN_MILLIS)
+                Log.w(
+                    TAG,
+                    "All usable keys are rate-limited; waiting ${waitMillis}ms " +
+                        "for the earliest cooldown to expire.",
+                )
+                delay(waitMillis)
+                currentCoroutineContext().ensureActive()
+                continue
+            }
 
-        completion ?: run {
-            val timeoutError = AiRequestException(
-                message = "The AI request timed out. Check your internet connection " +
-                    "and try again.",
-                stopBackgroundFetch = true,
+            throw buildExhaustedException(
+                attempts,
+                lastError ?: rememberedFailure(attempts),
             )
-            Log.e(AI_ERROR_TAG, "Execution error", timeoutError)
-            Log.e(
-                logTag,
-                "AI request exceeded the overall timeout of ${boundedTimeout}ms " +
-                    "after attempting ${attempts.size} provider(s).",
-            )
-            throw timeoutError
         }
+    }
+
+    /**
+     * Most recent remembered failure for a single-key pool. Multi-key pools
+     * intentionally get no remembered fallback so an old status cannot be
+     * misreported after a different key becomes terminal.
+     */
+    private fun rememberedFailure(attempts: List<ResolvedAiRequest>): Throwable? {
+        if (attempts.size != 1) return null
+        return attempts.firstNotNullOfOrNull { keyFailureReasons[it.keyIdentity()] }
+    }
+
+    /**
+     * Circularly rotates the pool so the next request starts at the next key.
+     * The rotation is process-wide and lock-free.
+     */
+    private fun roundRobinOrder(
+        attempts: List<ResolvedAiRequest>,
+    ): List<ResolvedAiRequest> {
+        if (attempts.size <= 1) return attempts
+        val start = Math.floorMod(roundRobinIndex.getAndIncrement(), attempts.size)
+        if (start == 0) return attempts
+        return buildList(attempts.size) {
+            addAll(attempts.subList(start, attempts.size))
+            addAll(attempts.subList(0, start))
+        }
+    }
+
+    /** Removes expired cooldowns so those keys rejoin the active pool. */
+    private fun purgeExpiredCooldowns() {
+        val now = System.currentTimeMillis()
+        for ((key, until) in keyCooldowns) {
+            if (now >= until) {
+                keyCooldowns.remove(key, until)
+            }
+        }
+    }
+
+    private fun isCoolingDown(key: String): Boolean {
+        val until = keyCooldowns[key] ?: return false
+        if (System.currentTimeMillis() >= until) {
+            keyCooldowns.remove(key, until)
+            return false
+        }
+        return true
+    }
+
+    private fun markProviderTemporarilyBusy(provider: AiProvider) {
+        providerBusyUntil[provider.name] = System.currentTimeMillis() + TIMEOUT_BUSY_MILLIS
+    }
+
+    private fun isProviderTemporarilyBusy(provider: AiProvider): Boolean {
+        val until = providerBusyUntil[provider.name] ?: return false
+        if (System.currentTimeMillis() >= until) {
+            providerBusyUntil.remove(provider.name, until)
+            return false
+        }
+        return true
+    }
+
+    /** Restores providers whose timeout-busy window has elapsed. */
+    private fun purgeExpiredProviderBusy() {
+        val now = System.currentTimeMillis()
+        for ((provider, until) in providerBusyUntil) {
+            if (now >= until) {
+                providerBusyUntil.remove(provider, until)
+            }
+        }
+    }
+
+    /**
+     * Retries 5xx and non-timeout network failures with 500ms/1000ms
+     * exponential backoff. Timeouts are rethrown immediately so the sweep can
+     * mark the provider busy and fail over without stalling the request. HTTP
+     * 4xx responses are classified by the caller so a 429 can immediately move
+     * to the next key and a 401/403 can be blacklisted.
+     */
+    private suspend fun executeProviderWithRetries(
+        httpClient: OkHttpClient,
+        config: ResolvedAiRequest,
+        systemPrompt: String,
+        userContent: String,
+        maxTokens: Int?,
+        temperature: Double,
+        logTag: String,
+    ): Pair<String, String> {
+        var retry = 0
+        while (true) {
+            try {
+                return executeProvider(
+                    httpClient = httpClient,
+                    config = config,
+                    systemPrompt = systemPrompt,
+                    userContent = userContent,
+                    maxTokens = maxTokens,
+                    temperature = temperature,
+                    logTag = logTag,
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (timeout: SocketTimeoutException) {
+                // Fail over immediately; retrying a stalled provider only
+                // delays switching to the next key/provider.
+                throw timeout
+            } catch (timeout: InterruptedIOException) {
+                throw timeout
+            } catch (error: Throwable) {
+                if (!error.isTransientRetryable() || retry >= MAX_TRANSIENT_RETRIES) {
+                    throw error
+                }
+                val delayMillis = BASE_BACKOFF_MILLIS * (1L shl retry)
+                Log.w(
+                    logTag,
+                    "Transient failure on ${config.provider.displayName} " +
+                        "(model=${config.model}, key=${config.keyFingerprint()}); " +
+                        "retrying in ${delayMillis}ms " +
+                        "(${retry + 1}/$MAX_TRANSIENT_RETRIES).",
+                    error,
+                )
+                delay(delayMillis)
+                retry++
+            }
+        }
+    }
+
+    private fun Throwable.isTransientRetryable(): Boolean {
+        val httpError = this as? AiProviderHttpException
+        if (httpError != null) return httpError.statusCode in 500..599
+        return this is IOException
     }
 
     private suspend fun executeProvider(
@@ -467,7 +893,10 @@ object AiFailoverManager {
             )
             return text to config.model
         } catch (error: AiProviderHttpException) {
-            val defaultModel = config.provider.defaultModel.trim()
+            val defaultModel = AiProviderClient.normalizeModelId(
+                config.provider,
+                config.provider.defaultModel,
+            )
             val savedModelRejected = defaultModel.isNotBlank() &&
                 !defaultModel.equals(config.model, ignoreCase = true) &&
                 (
@@ -501,9 +930,10 @@ object AiFailoverManager {
     }
 
     /**
-     * Every configured provider/key was attempted. The UI gets one stable,
-     * explicit message; provider/model/HTTP details stay in Logcat because the
-     * user cannot act on a per-gateway error once the whole pool is exhausted.
+     * Every configured provider/key was attempted. A single-key pool gets the
+     * exact HTTP status/server text or timeout reason so Settings testing and
+     * one-key users can act on it. Multi-key pools keep one stable message;
+     * per-gateway details remain in Logcat.
      */
     private fun buildExhaustedException(
         configs: List<ResolvedAiRequest>,
@@ -524,15 +954,87 @@ object AiFailoverManager {
                 "All ${configs.size} provider/key attempt(s) failed without a captured error.",
             )
         }
+
+        val singleConfig = configs.singleOrNull()
+        val message = when {
+            singleConfig == null -> ALL_KEYS_FAILED_MESSAGE
+
+            httpError != null -> formatSingleKeyHttpError(httpError)
+
+            lastError is SocketTimeoutException ||
+                lastError is InterruptedIOException ->
+                formatSingleKeyTimeout(singleConfig, lastError)
+
+            lastError != null -> "AI request failed for " +
+                "${singleConfig.provider.displayName}: " +
+                (
+                    lastError.localizedMessage
+                        ?.takeIf(String::isNotBlank)
+                        ?: lastError.message?.takeIf(String::isNotBlank)
+                        ?: lastError.javaClass.simpleName
+                    )
+
+            else -> ALL_KEYS_FAILED_MESSAGE
+        }
+
         return AiRequestException(
-            message = ALL_KEYS_FAILED_MESSAGE,
-            provider = configs.lastOrNull()?.provider,
-            model = configs.lastOrNull()?.model,
+            message = message,
+            provider = (singleConfig ?: configs.lastOrNull())?.provider,
+            model = (singleConfig ?: configs.lastOrNull())?.model,
             statusCode = httpError?.statusCode,
             allKeysExhausted = true,
             cause = lastError,
         )
     }
 
-    private const val MAX_FAILOVER_ATTEMPTS = 10
+    private fun formatSingleKeyHttpError(error: AiProviderHttpException): String {
+        val detail = error.serverMessage
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+        if (detail != null) return "HTTP ${error.statusCode}: $detail"
+
+        // The full exception message is built as
+        // "<provider> returned HTTP <code>: <body>". Reuse the body when the
+        // provider did not return parseable JSON.
+        val fallback = error.message
+            .orEmpty()
+            .substringAfter("HTTP ${error.statusCode}:", "")
+            .trim()
+            .takeIf(String::isNotBlank)
+        return if (fallback != null) {
+            "HTTP ${error.statusCode}: $fallback"
+        } else {
+            "HTTP ${error.statusCode}: request failed."
+        }
+    }
+
+    private fun formatSingleKeyTimeout(
+        config: ResolvedAiRequest,
+        error: Throwable,
+    ): String {
+        if (
+            config.provider == AiProvider.OPENCODE &&
+            OpenCodeModelPolicy.isFreeCliModel(config.model)
+        ) {
+            return "Timeout: Selected model '${config.model}' is restricted to the " +
+                "OpenCode CLI and may time out in the mobile app. Choose an " +
+                "unrestricted model in Settings."
+        }
+        val reason = error.message?.trim()?.takeIf(String::isNotBlank)
+        return buildString {
+            append("Timeout: ")
+            append(config.provider.displayName)
+            append(" did not respond")
+            if (reason != null) {
+                append(" (")
+                append(reason)
+                append(')')
+            }
+            append(". Model: ")
+            append(config.model)
+            append('.')
+        }
+    }
+
+    private const val MAX_FAILOVER_ATTEMPTS = 32
 }

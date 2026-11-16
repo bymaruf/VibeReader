@@ -5,6 +5,7 @@ import android.util.Log
 import com.example.vibereader.core.secure_storage.ApiKeyStore
 import com.example.vibereader.data.remote.DiscoveredModel
 import com.example.vibereader.data.remote.ModelDiscoveryService
+import com.example.vibereader.data.remote.OpenCodeModelPolicy
 import com.example.vibereader.model.AiProvider
 import com.example.vibereader.model.ProviderKeyConfig
 import kotlinx.coroutines.Dispatchers
@@ -127,11 +128,16 @@ class AiKeyVault(
             }?.let { return it }
         }
 
-        // OpenCode free-tier models are only callable from the OpenCode client,
-        // so only fall back to them after every paid model has been considered.
+        // OpenCode `*-free` models are commonly restricted to the OpenCode CLI
+        // and may time out in this app. Prefer every unrestricted model first,
+        // then fall back to a flagged free model only when nothing else exists.
         if (provider == AiProvider.OPENCODE) {
-            models.firstOrNull { !it.isFree && it.isFast }?.let { return it }
-            models.firstOrNull { !it.isFree }?.let { return it }
+            models.firstOrNull {
+                !it.isFree && !OpenCodeModelPolicy.isFreeCliModel(it.id)
+            }?.let { return it }
+            models.firstOrNull {
+                !OpenCodeModelPolicy.isFreeCliModel(it.id)
+            }?.let { return it }
         }
         if (provider == AiProvider.OPENROUTER) {
             models.firstOrNull { !it.isFree && it.id.contains("claude", ignoreCase = true) }

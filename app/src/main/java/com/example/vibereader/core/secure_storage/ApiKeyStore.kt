@@ -34,24 +34,26 @@ class ApiKeyStore(context: Context) {
     }
 
     fun saveApiKey(provider: ApiProvider, apiKey: String) {
-        val editor = preferences.edit().putString(provider.preferenceKey, apiKey)
-        if (provider == ApiProvider.OPENROUTER) editor.putString(API_KEY, apiKey)
+        val normalized = apiKey.normalizedKey().orEmpty()
+        val editor = preferences.edit().putString(provider.preferenceKey, normalized)
+        if (provider == ApiProvider.OPENROUTER) editor.putString(API_KEY, normalized)
         persistOrThrow(editor, "Could not persist the API key.")
     }
 
     fun getApiKey(provider: ApiProvider): String? =
-        preferences.getString(provider.preferenceKey, null)
+        preferences.getString(provider.preferenceKey, null).normalizedKey()
 
     fun saveApiKey(provider: AiProvider, apiKey: String) {
-        val editor = preferences.edit().putString(providerKey(provider), apiKey)
+        val normalized = apiKey.normalizedKey().orEmpty()
+        val editor = preferences.edit().putString(providerKey(provider), normalized)
         when (provider) {
             AiProvider.OPENROUTER -> editor
-                .putString(ApiProvider.OPENROUTER.preferenceKey, apiKey)
-                .putString(API_KEY, apiKey)
+                .putString(ApiProvider.OPENROUTER.preferenceKey, normalized)
+                .putString(API_KEY, normalized)
 
-            AiProvider.OPENAI -> editor.putString(ApiProvider.OPENAI.preferenceKey, apiKey)
+            AiProvider.OPENAI -> editor.putString(ApiProvider.OPENAI.preferenceKey, normalized)
 
-            AiProvider.ANTHROPIC -> editor.putString(ApiProvider.CLAUDE.preferenceKey, apiKey)
+            AiProvider.ANTHROPIC -> editor.putString(ApiProvider.CLAUDE.preferenceKey, normalized)
 
             AiProvider.OPENCODE,
             AiProvider.GEMINI,
@@ -64,7 +66,7 @@ class ApiKeyStore(context: Context) {
 
     fun saveProviderConfig(config: ProviderKeyConfig) {
         setProviderEnabled(config.provider, config.isEnabled)
-        if (config.apiKey.isBlank()) {
+        if (config.apiKey.normalizedKey() == null) {
             clearApiKey(config.provider)
         } else {
             saveApiKey(config.provider, config.apiKey)
@@ -96,8 +98,10 @@ class ApiKeyStore(context: Context) {
     }
 
     fun getApiKey(provider: AiProvider): String? {
-        val savedKey = preferences.getString(providerKey(provider), null)
-        if (!savedKey.isNullOrBlank()) return savedKey
+        // The provider's own encrypted entry always wins. OpenCode has no
+        // legacy entry and no build-time credential, so it can only ever use
+        // exactly the key saved under ai_opencode_api_key.
+        preferences.getString(providerKey(provider), null).normalizedKey()?.let { return it }
         val legacyKey = when (provider) {
             AiProvider.OPENROUTER -> getApiKey(ApiProvider.OPENROUTER)
             AiProvider.OPENAI -> getApiKey(ApiProvider.OPENAI)
@@ -108,8 +112,8 @@ class ApiKeyStore(context: Context) {
             AiProvider.DEEPSEEK,
             -> null
         }
-        return legacyKey?.takeIf(String::isNotBlank)
-            ?: BuildConfigApiKeys.forProvider(provider)
+        return legacyKey.normalizedKey()
+            ?: BuildConfigApiKeys.forProvider(provider)?.normalizedKey()
     }
 
     fun isConfigured(provider: AiProvider): Boolean =
@@ -150,7 +154,8 @@ class ApiKeyStore(context: Context) {
     }
 
     fun getApiKey(): String? =
-        getApiKey(AiProvider.OPENROUTER) ?: preferences.getString(API_KEY, null)
+        getApiKey(AiProvider.OPENROUTER)
+            ?: preferences.getString(API_KEY, null).normalizedKey()
 
     fun clearApiKey() {
         clearApiKey(ApiProvider.OPENROUTER)
@@ -168,6 +173,12 @@ class ApiKeyStore(context: Context) {
     ) {
         check(editor.commit()) { errorMessage }
     }
+
+    private fun String?.normalizedKey(): String? =
+        this?.trim()
+            ?.trim('"', '\'')
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
 
     private fun providerKey(provider: AiProvider): String =
         "ai_${provider.name.lowercase()}_api_key"

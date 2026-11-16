@@ -27,6 +27,33 @@ fun localBuildConfigString(name: String): String {
     return "\"$escaped\""
 }
 
+/**
+ * Builds a Java `String[]` initializer for a comma-separated local.properties
+ * value. Entries are trimmed, surrounding quotes are removed, placeholders are
+ * skipped, and duplicates are dropped. Falls back to [fallbackName] for
+ * backwards compatibility when the multi-key property is absent/empty.
+ */
+fun localBuildConfigStringArray(name: String, fallbackName: String? = null): String {
+    fun parse(raw: String?): List<String> = raw
+        .orEmpty()
+        .split(',')
+        .map { it.trim().trim('"', '\'').trim() }
+        .filter { it.isNotEmpty() && it != "your_key_here" }
+        .distinct()
+
+    val multiKeys = parse(localProperties.getProperty(name))
+    val values = multiKeys.ifEmpty {
+        parse(fallbackName?.let(localProperties::getProperty))
+    }
+    val entries = values.joinToString(separator = ", ") { value ->
+        val escaped = value
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+        "\"$escaped\""
+    }
+    return "new String[]{$entries}"
+}
+
 android {
     namespace = "com.example.vibereader"
     compileSdk {
@@ -54,6 +81,11 @@ android {
             "String",
             "GEMINI_API_KEY",
             localBuildConfigString("GEMINI_API_KEY"),
+        )
+        buildConfigField(
+            "String[]",
+            "GEMINI_API_KEYS",
+            localBuildConfigStringArray("GEMINI_API_KEYS", "GEMINI_API_KEY"),
         )
         buildConfigField(
             "String",

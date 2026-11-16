@@ -1,10 +1,9 @@
 package com.example.vibereader.data.remote
 
 import android.content.Context
-import com.example.vibereader.core.secure_storage.ApiKeyStore
 import com.example.vibereader.data.local.AiKeyVault
+import com.example.vibereader.data.repository.AiFailoverManager
 import com.example.vibereader.domain.QuoteQualityValidator
-import com.example.vibereader.model.AiProvider
 import okhttp3.OkHttpClient
 import org.json.JSONArray
 import org.json.JSONObject
@@ -15,6 +14,8 @@ import kotlin.math.absoluteValue
 class WallpaperQuoteCurator(context: Context) {
     private val appContext = context.applicationContext
     private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
         .callTimeout(REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build()
 
@@ -30,44 +31,22 @@ class WallpaperQuoteCurator(context: Context) {
         }
 
         var setupFailure: Exception? = null
-        val apiKeyStore = try {
-            ApiKeyStore(appContext)
-        } catch (error: Exception) {
-            setupFailure = error
-            null
-        }
         val keyVault = try {
             AiKeyVault(appContext)
         } catch (error: Exception) {
             setupFailure = error
             null
         }
-        val configs = try {
-            apiKeyStore
-                ?.getEnabledProviderConfigs(apiKeyStore.getSelectedAiProvider())
-                .orEmpty()
-                .filter { it.isEnabled && it.apiKey.isNotBlank() }
-        } catch (error: Exception) {
-            setupFailure = error
-            emptyList()
-        }
 
         var aiFailure: Exception? = null
-        for (config in configs) {
+        if (keyVault != null) {
             try {
-                // Model selection is persisted per provider in DataStore; key/failover
-                // routing (configs above) is unchanged.
-                val model = keyVault?.getAiModel(config.provider)
-                    ?.takeIf(String::isNotBlank)
-                    ?: config.provider.defaultModel
                 return CuratedWallpaperQuote(
                     quote = requestCuratedCandidate(
-                        config.provider,
-                        config.apiKey,
-                        model,
-                        bookTitle,
-                        bookAuthor,
-                        candidates,
+                        keyVault = keyVault,
+                        bookTitle = bookTitle,
+                        bookAuthor = bookAuthor,
+                        candidates = candidates,
                     ),
                     source = QuoteSelectionSource.AI,
                 )
@@ -82,9 +61,14 @@ class WallpaperQuoteCurator(context: Context) {
             ?: throw IOException("No complete, meaningful quote was found in the saved text or book.")
         return CuratedWallpaperQuote(
             quote = localChoice,
-            source = if (aiFailure == null) QuoteSelectionSource.LOCAL else QuoteSelectionSource.LOCAL_AFTER_AI_FAILURE,
-            fallbackReason = aiFailure?.message ?: setupFailure?.message
-                ?: if (configs.isEmpty()) "No AI provider key is configured." else null,
+            source = if (aiFailure == null) {
+                QuoteSelectionSource.LOCAL
+            } else {
+                QuoteSelectionSource.LOCAL_AFTER_AI_FAILURE
+            },
+            fallbackReason = aiFailure?.message
+                ?: setupFailure?.message
+                ?: if (keyVault == null) "AI key storage is unavailable." else null,
         )
     }
 
@@ -104,9 +88,7 @@ class WallpaperQuoteCurator(context: Context) {
             .map(String::trim)
 
     private suspend fun requestCuratedCandidate(
-        provider: AiProvider,
-        apiKey: String,
-        model: String,
+        keyVault: AiKeyVault,
         bookTitle: String,
         bookAuthor: String?,
         candidates: List<String>,
@@ -122,23 +104,25 @@ class WallpaperQuoteCurator(context: Context) {
             .put("bookAuthor", bookAuthor.orEmpty())
             .put("candidates", JSONArray(candidates))
             .toString()
-        val responseText = AiProviderClient.executeChat(
-            client = httpClient,
-            provider = provider,
-            apiKey = apiKey,
-            model = model,
+        val completion = AiFailoverManager.completeValidated(
+            keyVault = keyVault,
+            httpClient = httpClient,
             systemPrompt = systemPrompt,
             userContent = userContent,
             maxTokens = MAX_QUOTE_TOKENS,
             temperature = 0.1,
+            logTag = TAG,
+            validate = { responseText ->
+                val index = JSONObject(responseText).getInt("index")
+                val selected = candidates.getOrNull(index)
+                    ?: throw IOException("The AI provider selected an invalid quote candidate.")
+                if (!QuoteQualityValidator.isValidQuote(selected)) {
+                    throw IOException("The AI provider selected a quote that failed quality checks.")
+                }
+                selected
+            },
         )
-        val index = JSONObject(responseText).getInt("index")
-        val selected = candidates.getOrNull(index)
-            ?: throw IOException("The AI provider selected an invalid quote candidate.")
-        if (!QuoteQualityValidator.isValidQuote(selected)) {
-            throw IOException("The AI provider selected a quote that failed quality checks.")
-        }
-        return selected
+        return completion.value
     }
 
     private fun localQualityScore(quote: String): Int {
@@ -153,7 +137,8 @@ class WallpaperQuoteCurator(context: Context) {
         private const val MAX_CANDIDATES = 100
         private const val MAX_CANDIDATE_CHARS = 600
         private const val MAX_QUOTE_TOKENS = 40
-        private const val REQUEST_TIMEOUT_SECONDS = 20L
+        private const val REQUEST_TIMEOUT_SECONDS = 120L
+        private const val TAG = "WallpaperQuoteCurator"
         private val WHITESPACE = Regex("""\s+""")
         private val SENTENCE_BOUNDARY = Regex("""(?<=[.!?])\s+""")
     }

@@ -4,23 +4,38 @@ import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import com.example.vibereader.core.database.VibeReaderDatabase
+import com.example.vibereader.data.document.EBookDocumentLoader
 import com.example.vibereader.data.local.AiKeyVault
 import com.example.vibereader.data.room.QuoteEntity
 import com.example.vibereader.data.room.QuoteSource
 import com.example.vibereader.domain.QuoteQualityValidator
+import com.example.vibereader.domain.model.EBookFormat
+import com.example.vibereader.domain.prompt.AiContextSanitizer
+import com.example.vibereader.domain.prompt.AiPromptTemplates
+import com.example.vibereader.domain.prompt.LocalKeywordRetriever
 import com.example.vibereader.model.AiProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
+import org.json.JSONArray
+import java.io.File
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 data class AiQuoteFetchResult(
     val insertedCount: Int,
-    val provider: AiProvider,
-    val model: String,
+    val provider: AiProvider?,
+    val model: String?,
     val quotes: List<String>,
+)
+
+/** Result of the zero-context quote attempt. */
+private data class AiQuoteAttempt(
+    val quotes: List<String>,
+    val unknownBook: Boolean,
 )
 
 /**
@@ -42,13 +57,17 @@ private class AiQuoteValidationException(message: String) : Exception(message)
  * - Validates key+model are non-blank before any network call; missing setup
  *   fails immediately with [AiRuntimeResolver.SETUP_ERROR_MESSAGE].
  *
- * Failover:
- * - [AiFailoverManager] tries the selected provider first, then OpenRouter,
- *   OpenCode, Gemini, Claude, and any remaining enabled providers/keys,
- *   retrying on HTTP 401/403/404/429, any HTTP/network/timeout error, or
- *   unexpected runtime error.
+ * Failover and key rotation:
+ * - [AiFailoverManager] resolves the whole provider/key pool per request and
+ *   starts on the next entry from its process-wide round-robin cursor. Gemini
+ *   contributes the saved key plus every build-time `GEMINI_API_KEYS` entry.
+ * - HTTP 429 parks only that key for 60 seconds and immediately continues with
+ *   the next key; expired cooldowns rejoin the pool automatically.
+ * - HTTP 401/403 disables the key for the rest of the app session.
+ * - Timeouts, network failures, and 5xx responses get up to two exponential
+ *   backoff retries on the same key before the sweep advances.
  * - Parsing/validation failures are attempt failures too: an HTTP 200 response
- *   with no usable quotes advances to the next provider instead of surfacing a
+ *   with no usable quotes advances to the next key instead of surfacing a
  *   provider-specific error immediately.
  * - Each failover attempt uses the model saved for the provider being tried
  *   (re-resolved per request through the failover pool), never another
@@ -64,9 +83,12 @@ class AiQuoteRepository(
     private val keyVault: AiKeyVault = AiKeyVault(context.applicationContext),
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .callTimeout(75, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(120, TimeUnit.SECONDS)
         .build(),
+    private val documentLoader: EBookDocumentLoader = EBookDocumentLoader(context.applicationContext),
+    private val responseCache: AiResponseCache = AiResponseCache(database),
 ) {
     /** Centralized, thread-safe active AI config snapshot (IO-safe callers). */
     fun getActiveAiConfig(): ActiveAiConfig = AiRuntimeResolver.getActiveAiConfig(keyVault)
@@ -152,70 +174,339 @@ class AiQuoteRepository(
             throw AiConfigurationException("Open a book before fetching AI quotes.")
         }
 
-        // Resolve synchronously before any network work. A missing key/model
-        // throws the exact setup message; no request is sent with a blank model.
-        val active = AiRuntimeResolver.resolveActive(keyVault)
-        Log.d(
-            TAG,
-            "Starting quote fetch with ${active.provider.shortLabel}, " +
-                "preference=${active.modelPreferenceKey}, model=${active.model}, " +
-                "book=$bookId.",
-        )
+        purgeLeakedQuotes()
+
+        // No single key is resolved here: the failover manager resolves the
+        // whole pool, starts at the round-robin cursor, and throws the setup
+        // error before any network call when the pool is empty.
+        Log.d(TAG, "Starting quote fetch for book=$bookId.")
 
         val count = batchSize.coerceAtLeast(1)
-        val authorHint = bookAuthor?.takeIf(String::isNotBlank)?.let { " by $it" }.orEmpty()
-        val systemPrompt =
-            "You are a literary quote curator. Return only a JSON array of strings. " +
-                "Each string must be a complete, standalone quote copied faithfully from the book. " +
-                "Do not add commentary, markdown fences, numbering, or invented text."
-        val exclusion = alreadyCollected
-            .asReversed()
-            .take(MAX_EXCLUSION_QUOTES)
-            .takeIf { it.isNotEmpty() }
-            ?.joinToString(separator = "\n") { "- ${it.take(MAX_EXCLUSION_CHARS)}" }
-            ?.let { "\nDo not repeat these already collected quotes:\n$it" }
-            .orEmpty()
-        val userContent =
-            "Find up to $count new, profound, complete, and highly meaningful quotes from " +
-                "the book '$bookTitle'$authorHint. Return as a JSON array of strings. " +
-                "If fewer new quotes remain, return as many as you can find.$exclusion"
+        val safeTitle = bookTitle.trim().ifBlank { "this book" }
+        val author = bookAuthor?.trim()?.takeIf(String::isNotBlank)
+        val exclusions = recentExclusions(alreadyCollected)
+        val cacheHash = AiResponseCache.hash(
+            "quotes",
+            safeTitle,
+            author.orEmpty(),
+            count.toString(),
+            exclusions.joinToString("\u0000"),
+        )
+        val existingKeys = database.quoteDao()
+            .getForBook(bookId)
+            .mapTo(mutableSetOf()) { dedupeKey(it.selectedText) }
+        alreadyCollected.forEach { existingKeys += dedupeKey(it) }
 
-        // The validator runs inside the failover sweep. An HTTP 200 response
-        // that cannot be parsed into usable quotes is treated exactly like a
-        // request failure, so the next provider/key is tried immediately.
-        val completion = AiFailoverManager.completeValidated(
-            keyVault = keyVault,
-            httpClient = httpClient,
-            systemPrompt = systemPrompt,
+        val cachedQuotes = readCachedQuotes(bookId, cacheHash, existingKeys, count)
+        if (cachedQuotes.isNotEmpty()) {
+            Log.d(TAG, "Quote batch served from Room cache for book=$bookId.")
+            return persistResult(
+                bookId = bookId,
+                quotes = cachedQuotes,
+                chapter = chapter,
+                provider = null,
+                model = null,
+                onQuotePersisted = onQuotePersisted,
+            )
+        }
+
+        // 1) Zero-context: title and author only. A model that recognizes the
+        //    published book can quote it from built-in knowledge; UNKNOWN_BOOK
+        //    switches to local paragraph retrieval below.
+        val metadata = tryMetadataQuotes(
+            bookId = bookId,
+            bookTitle = safeTitle,
+            author = author,
+            count = count,
+        )
+        if (metadata != null && metadata.value.quotes.isNotEmpty()) {
+            cacheQuotes(bookId, cacheHash, metadata.value.quotes)
+            return persistResult(
+                bookId = bookId,
+                quotes = metadata.value.quotes,
+                chapter = chapter,
+                provider = metadata.provider,
+                model = metadata.model,
+                onQuotePersisted = onQuotePersisted,
+            )
+        }
+        if (metadata?.value?.unknownBook == true) {
+            Log.d(
+                TAG,
+                "Model reported UNKNOWN_BOOK for '$safeTitle'; using local retrieval.",
+            )
+        }
+
+        // 2) Local BM25 retrieval: four sanitized paragraphs, ~2,500 chars.
+        val snippets = loadLocalQuoteSnippets(
+            bookId = bookId,
+            bookTitle = safeTitle,
+            author = author,
+            alreadyCollected = alreadyCollected,
+        )
+        val userContent = if (snippets.isNotEmpty()) {
+            AiPromptTemplates.buildQuoteRagRequest(
+                bookTitle = safeTitle,
+                author = author,
+                passages = snippets.joinToString("\n\n"),
+                count = count,
+                excludedQuotes = exclusions,
+            )
+        } else {
+            // PDFs and older imports may have no stored text. Keep the previous
+            // best-effort behavior, but still cap output and reject invented
+            // quotes through the normal validator.
+            Log.d(TAG, "No local text for '$safeTitle'; using best-effort metadata.")
+            AiPromptTemplates.buildQuoteBestEffortRequest(
+                bookTitle = safeTitle,
+                author = author,
+                count = count,
+                excludedQuotes = exclusions,
+            )
+        }
+        val completion = requestQuoteBatch(
             userContent = userContent,
-            maxTokens = MAX_FETCH_TOKENS,
-            temperature = 0.5,
-            logTag = TAG,
-            overallTimeoutMillis = REQUEST_TIMEOUT_MILLIS,
-            validate = { raw -> extractUsableQuotes(raw, count, bookId) },
+            count = count,
+            bookId = bookId,
         )
-        Log.d(
-            TAG,
-            "Received ${completion.value.size} usable quote(s) from " +
-                "${completion.provider.shortLabel} model=${completion.model}.",
-        )
-
-        val inserted = persistQuotes(
+        cacheQuotes(bookId, cacheHash, completion.value)
+        return persistResult(
             bookId = bookId,
             quotes = completion.value,
+            chapter = chapter,
+            provider = completion.provider,
+            model = completion.model,
+            onQuotePersisted = onQuotePersisted,
+        )
+    }
+
+    /**
+     * Deletes old quote rows created from model reasoning/thinking text. Runs
+     * before every fetch so bad cards disappear without a database migration.
+     */
+    private suspend fun purgeLeakedQuotes() {
+        try {
+            val dao = database.quoteDao()
+            val leaked = dao.observeAll()
+                .first()
+                .filter { AiQuoteResponseParser.isLeakText(it.selectedText) }
+            if (leaked.isEmpty()) return
+            leaked.forEach { dao.delete(it) }
+            Log.d(TAG, "Removed ${leaked.size} leaked reasoning quote(s).")
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            Log.w(TAG, "Could not purge leaked reasoning quotes.", error)
+        }
+    }
+
+    private suspend fun tryMetadataQuotes(
+        bookId: String,
+        bookTitle: String,
+        author: String?,
+        count: Int,
+    ): AiValidatedCompletion<AiQuoteAttempt>? = try {
+        AiFailoverManager.completeValidated(
+            keyVault = keyVault,
+            httpClient = httpClient,
+            systemPrompt = AiPromptTemplates.buildQuoteSystemPrompt(),
+            userContent = AiPromptTemplates.buildCompactQuoteMetadataRequest(
+                bookTitle = bookTitle,
+                author = author,
+                count = count,
+            ),
+            maxTokens = MAX_FETCH_TOKENS,
+            temperature = 0.4,
+            logTag = TAG,
+            overallTimeoutMillis = REQUEST_TIMEOUT_MILLIS,
+            validate = { raw ->
+                if (AiPromptTemplates.isUnknownBookResponse(raw)) {
+                    AiQuoteAttempt(quotes = emptyList(), unknownBook = true)
+                } else {
+                    AiQuoteAttempt(
+                        quotes = extractUsableQuotes(raw, count, bookId),
+                        unknownBook = false,
+                    )
+                }
+            },
+        )
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (config: AiConfigurationException) {
+        throw config
+    } catch (error: AiRequestException) {
+        if (error.stopBackgroundFetch) throw error
+        Log.w(TAG, "Metadata quote attempt failed; using local retrieval.", error)
+        null
+    } catch (error: Throwable) {
+        Log.w(TAG, "Metadata quote attempt failed; using local retrieval.", error)
+        null
+    }
+
+    private suspend fun requestQuoteBatch(
+        userContent: String,
+        count: Int,
+        bookId: String,
+    ): AiValidatedCompletion<List<String>> = AiFailoverManager.completeValidated(
+        keyVault = keyVault,
+        httpClient = httpClient,
+        systemPrompt = AiPromptTemplates.buildQuoteSystemPrompt(),
+        userContent = userContent,
+        maxTokens = MAX_FETCH_TOKENS,
+        temperature = 0.4,
+        logTag = TAG,
+        overallTimeoutMillis = REQUEST_TIMEOUT_MILLIS,
+        validate = { raw -> extractUsableQuotes(raw, count, bookId) },
+    )
+
+    private suspend fun readCachedQuotes(
+        bookId: String,
+        cacheHash: String,
+        existingKeys: Set<String>,
+        count: Int,
+    ): List<String> {
+        val cached = responseCache.get(bookId, AiResponseCache.KIND_QUOTES, cacheHash)
+            ?: return emptyList()
+        return AiQuoteResponseParser.parse(cached)
+            .map(::normalizeQuote)
+            .filter(QuoteQualityValidator::isValidQuote)
+            .distinctBy(::dedupeKey)
+            .filterNot { dedupeKey(it) in existingKeys }
+            .take(count)
+    }
+
+    private suspend fun cacheQuotes(
+        bookId: String,
+        cacheHash: String,
+        quotes: List<String>,
+    ) {
+        if (quotes.isEmpty()) return
+        val encoded = runCatching { JSONArray(quotes).toString() }.getOrNull() ?: return
+        responseCache.put(
+            bookId = bookId,
+            cacheKind = AiResponseCache.KIND_QUOTES,
+            queryHash = cacheHash,
+            content = encoded,
+        )
+    }
+
+    private fun recentExclusions(alreadyCollected: List<String>): List<String> =
+        alreadyCollected
+            .asReversed()
+            .asSequence()
+            .map(AiContextSanitizer::oneLine)
+            .filter(String::isNotBlank)
+            .map { it.take(MAX_EXCLUSION_CHARS) }
+            .distinctBy(::dedupeKey)
+            .take(MAX_EXCLUSION_QUOTES)
+            .toList()
+
+    private suspend fun loadLocalQuoteSnippets(
+        bookId: String,
+        bookTitle: String,
+        author: String?,
+        alreadyCollected: List<String>,
+    ): List<String> {
+        val sources = loadBookSources(bookId)
+        if (sources.isEmpty()) return emptyList()
+        val query = buildString {
+            append(bookTitle)
+            author?.let {
+                append(' ')
+                append(it)
+            }
+            append(" meaningful memorable profound quote")
+        }
+        return LocalKeywordRetriever.selectRelevantSnippets(
+            query = query,
+            sources = sources,
+            maxSnippets = RETRIEVAL_SNIPPETS,
+            maxChars = RETRIEVAL_CHARS,
+            excludePhrases = alreadyCollected
+                .asReversed()
+                .take(MAX_EXCLUSION_QUOTES),
+            preferQuotes = true,
+        )
+    }
+
+    private suspend fun loadBookSources(bookId: String): List<String> {
+        val stored = database.bookChapterDao()
+            .getForBook(bookId)
+            .map { it.text }
+            .filter(String::isNotBlank)
+        if (stored.isNotEmpty()) return stored
+
+        return try {
+            withTimeoutOrNull(LOCAL_TEXT_TIMEOUT_MILLIS) {
+                val book = database.bookDao().getById(bookId)
+                    ?: return@withTimeoutOrNull emptyList()
+                val file = File(book.filePath)
+                if (!file.isFile) return@withTimeoutOrNull emptyList()
+                val format = EBookFormat.fromLabel(book.format)
+                    ?: return@withTimeoutOrNull emptyList()
+                when (format) {
+                    EBookFormat.EPUB -> documentLoader.loadDocument(
+                        bookId = bookId,
+                        file = file,
+                        format = format,
+                        fallbackTitle = book.title,
+                        includeChapters = true,
+                    ).chapters.map { it.text }
+
+                    EBookFormat.PDF -> buildList {
+                        var emptyPages = 0
+                        for (page in 0 until MAX_PDF_SAMPLE_PAGES) {
+                            val text = try {
+                                documentLoader.readChapterText(file, format, page)
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (error: Throwable) {
+                                Log.w(TAG, "Could not read PDF page $page for quotes.", error)
+                                ""
+                            }
+                            if (text.isBlank()) {
+                                emptyPages++
+                                if (emptyPages >= 2) break
+                            } else {
+                                emptyPages = 0
+                                add(text)
+                            }
+                        }
+                    }
+                }
+            }.orEmpty().filter(String::isNotBlank)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            Log.w(TAG, "Local quote retrieval could not read book=$bookId.", error)
+            emptyList()
+        }
+    }
+
+    private suspend fun persistResult(
+        bookId: String,
+        quotes: List<String>,
+        chapter: String?,
+        provider: AiProvider?,
+        model: String?,
+        onQuotePersisted: ((QuoteEntity) -> Unit)?,
+    ): AiQuoteFetchResult {
+        val inserted = persistQuotes(
+            bookId = bookId,
+            quotes = quotes,
             chapter = chapter,
             onQuotePersisted = onQuotePersisted,
         )
         Log.d(
             TAG,
-            "Kept ${completion.value.size} quote(s), inserted $inserted new " +
+            "Kept ${quotes.size} quote(s), inserted $inserted new " +
                 "AI quote(s) for book=$bookId.",
         )
         return AiQuoteFetchResult(
             insertedCount = inserted,
-            provider = completion.provider,
-            model = completion.model,
-            quotes = completion.value,
+            provider = provider,
+            model = model,
+            quotes = quotes,
         )
     }
 
@@ -338,13 +629,17 @@ class AiQuoteRepository(
 
     companion object {
         const val DEFAULT_BATCH_SIZE = 10
-        const val REQUEST_TIMEOUT_MILLIS = 90_000L
+        const val REQUEST_TIMEOUT_MILLIS = 110_000L
         private const val AI_ERROR_TAG = "VibeReader_AI"
-        private const val MAX_EXCLUSION_QUOTES = 120
-        private const val MAX_EXCLUSION_CHARS = 80
-        private const val MAX_FETCH_TOKENS = 4096
+        private const val MAX_EXCLUSION_QUOTES = 24
+        private const val MAX_EXCLUSION_CHARS = 70
+        private const val MAX_FETCH_TOKENS = 1500
         private const val MAX_QUOTE_CHARS = 4_000
         private const val MAX_CHAPTER_CHARS = 240
+        private const val RETRIEVAL_SNIPPETS = 4
+        private const val RETRIEVAL_CHARS = 2_500
+        private const val MAX_PDF_SAMPLE_PAGES = 8
+        private const val LOCAL_TEXT_TIMEOUT_MILLIS = 20_000L
         private const val PREVIEW_CHARS = 400
         private const val TERMINAL_STOP_WINDOW_MILLIS = 2_000L
         private const val TAG = "AiQuoteRepository"
@@ -365,69 +660,43 @@ internal object AiQuoteResponseParser {
         val cleaned = stripFences(raw)
         if (cleaned.isBlank()) return emptyList()
 
-        val jsonQuotes = extractJson(cleaned)
-            ?.let(::extractQuotes)
-            .orEmpty()
-        if (jsonQuotes.isNotEmpty()) return jsonQuotes
-        return parsePlainText(cleaned)
+        // Quotes are accepted only from a valid JSON array. Plain prose,
+        // markdown lists, and reasoning text are never treated as quotes.
+        val root = extractJsonArray(cleaned) ?: return emptyList()
+        return extractQuotes(root).filterNot(::isLeakText)
     }
+
+    /** True when text looks like model reasoning rather than a book quote. */
+    fun isLeakText(text: String): Boolean =
+        LEAK_MARKERS.any { marker -> text.contains(marker, ignoreCase = true) }
 
     private fun stripFences(raw: String): String {
         var text = raw.trim()
-        if (text.startsWith("```")) {
-            val firstLineEnd = text.indexOf('\n')
-            text = if (firstLineEnd >= 0) {
-                text.substring(firstLineEnd + 1)
-            } else {
-                text
-                    .removePrefix("```json")
-                    .removePrefix("```JSON")
-                    .removePrefix("```")
-            }.trim()
+        val fenceStart = text.indexOf("```")
+        if (fenceStart >= 0) {
+            val lineEnd = text.indexOf('\n', fenceStart)
+            val contentStart = if (lineEnd >= 0) lineEnd + 1 else fenceStart + 3
+            val fenceEnd = text.indexOf("```", contentStart)
+            if (fenceEnd > contentStart) {
+                text = text.substring(contentStart, fenceEnd)
+            }
         }
-        if (text.endsWith("```")) {
-            text = text.removeSuffix("```").trim()
-        }
-        return text
+        return text.trim()
     }
 
-    /** Tries every JSON-looking start so prose before the payload is tolerated. */
-    private fun extractJson(text: String): Any? {
+    /** Tries every JSON-array start so prose before the payload is tolerated. */
+    private fun extractJsonArray(text: String): List<*>? {
         for (start in text.indices) {
-            if (text[start] != '[' && text[start] != '{') continue
+            if (text[start] != '[') continue
             val value = runCatching { JsonScanner(text, start).parseValue() }.getOrNull()
-            if (value is List<*> || value is Map<*, *>) return value
+            if (value is List<*>) return value
         }
         return null
     }
 
     private fun extractQuotes(root: Any?): List<String> = when (root) {
         is List<*> -> root.mapNotNull(::stringFromItem)
-        is Map<*, *> -> quotesFromObject(root, depth = 0)
         else -> emptyList()
-    }
-
-    private fun quotesFromObject(map: Map<*, *>, depth: Int): List<String> {
-        ARRAY_FIELDS.forEach { field ->
-            when (val value = map[field]) {
-                is List<*> -> {
-                    val quotes = value.mapNotNull(::stringFromItem)
-                    if (quotes.isNotEmpty()) return quotes
-                }
-
-                is Map<*, *> -> if (depth < MAX_OBJECT_DEPTH) {
-                    val quotes = quotesFromObject(value, depth + 1)
-                    if (quotes.isNotEmpty()) return quotes
-                }
-            }
-        }
-        STRING_FIELDS.forEach { field ->
-            val quote = (map[field] as? String)
-                ?.let(::cleanItem)
-                ?.takeIf(String::isNotEmpty)
-            if (quote != null) return listOf(quote)
-        }
-        return emptyList()
     }
 
     private fun stringFromItem(item: Any?): String? = when (item) {
@@ -440,22 +709,6 @@ internal object AiQuoteResponseParser {
 
         else -> null
     }
-
-    private fun parsePlainText(text: String): List<String> = text
-        .lineSequence()
-        .map(String::trim)
-        .filter(String::isNotBlank)
-        .filterNot { it.startsWith("{") || it.startsWith("[") || it.endsWith("}") }
-        .map { line ->
-            line
-                .removePrefix("- ")
-                .removePrefix("* ")
-                .removePrefix("• ")
-                .replace(NUMBER_PREFIX, "")
-        }
-        .map(::cleanItem)
-        .filter { it.length >= MIN_PLAIN_TEXT_LENGTH }
-        .toList()
 
     private fun cleanItem(raw: String): String = raw
         .replace(WHITESPACE, " ")
@@ -625,10 +878,17 @@ internal object AiQuoteResponseParser {
         }
     }
 
-    private const val MIN_PLAIN_TEXT_LENGTH = 20
-    private const val MAX_OBJECT_DEPTH = 2
-    private val ARRAY_FIELDS = listOf("quotes", "data", "results", "items", "highlights")
     private val STRING_FIELDS = listOf("quote", "text", "content", "selectedText", "excerpt")
-    private val NUMBER_PREFIX = Regex("""^\d+[.)]\s*""")
+    private val LEAK_MARKERS = listOf(
+        "UNKNOWN_BOOK",
+        "JSON array",
+        "User asks:",
+        "We need",
+        "Task:",
+        "Instructions",
+        "Not sure",
+        "appears in the book",
+        "thinking process",
+    )
     private val WHITESPACE = Regex("""\s+""")
 }
