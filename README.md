@@ -8,6 +8,13 @@ wallpapers that automatically rotate on your home screen, lock screen, or both.
 Everything is written in Kotlin with Jetpack Compose. Books and quotes stay on your device;
 AI features are optional and use API keys that you provide (stored encrypted on-device).
 
+## Screenshots
+
+| | | |
+| --- | --- | --- |
+| <img src="screenshots/library.jpeg" width="230"> | <img src="screenshots/reader-oled.jpeg" width="230"> | <img src="screenshots/ai-assistant.jpeg" width="230"> |
+| <img src="screenshots/wallpaper-studio.jpeg" width="230"> | <img src="screenshots/homescreen-wallpaper.jpeg" width="230"> | <img src="screenshots/ai-settings.jpeg" width="230"> |
+
 ## Features
 
 ### Library
