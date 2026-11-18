@@ -16,10 +16,14 @@ AI features are optional and use API keys that you provide (stored encrypted on-
 - Book grid or list views with cover art, format badges, reading progress and share actions.
 - Search your library and switch between grid and list views; books are ordered by recent activity
   and opening one resumes where you left off.
+- Import books manually from **Settings** (single files or a folder, with a persisted SAF URI).
 
 ### PDF & EPUB reading
-- PDF rendering with pinch-to-zoom, pan, horizontal or vertical page scrolling, and a page slider.
-- EPUB support with chapter parsing (Jsoup), custom pagination and a dedicated renderer.
+- PDF pages rendered with Android's native `PdfRenderer` (PDFBox-Android supplies metadata and text),
+  with pinch/double-tap zoom, pan, a crop-whitespace toggle, horizontal or vertical scrolling, and a
+  page slider.
+- EPUB support with chapter parsing (epublib + Jsoup), paginated or continuous-scroll modes, and
+  typography controls for font size, line height and margins.
 - Text selection with actions to **highlight/unhighlight**, **save as quote**, **copy**, **translate**,
   **ask AI**, and **look up in a dictionary app** (single words). Highlight positions persist
   across sessions.
@@ -27,7 +31,7 @@ AI features are optional and use API keys that you provide (stored encrypted on-
 - Per-book reading themes and global reader preferences saved in Room.
 
 ### AI Book Assistant
-- Ask free-form questions about the book you are reading ("Ask this book"), with local keyword
+- Ask questions scoped to the **selection, current page, chapter, or entire book**, with local keyword
   retrieval that supplies relevant excerpts as context and sanitizers that keep prompts and
   responses scoped and safe.
 - One-tap **Summarize**, **Explain** and **Extract quote** actions.
@@ -35,9 +39,9 @@ AI features are optional and use API keys that you provide (stored encrypted on-
   quotes are always listed above AI suggestions.
 - Multiple providers: **OpenCode Zen, Google Gemini, OpenAI, OpenRouter, Anthropic Claude, Groq,
   and DeepSeek**, with dynamic model discovery (FREE / PAID / PRO tiers).
-- Resilient request handling: rotating provider/key pool, 60-second cooldown after HTTP 429,
-  session-wide blacklisting of rejected keys, and a local cache for repeated AI responses.
-  If all AI paths fail, local quote selection takes over.
+- Resilient request handling: a rotating provider/key pool with cooldowns for rate-limited or
+  rejected keys, automatic retries, a local cache for repeated AI responses, and a local fallback
+  when AI is unavailable.
 
 ### Wallpaper Studio
 - Turns **approved** quotes into 1080 × 2400 typography wallpapers with the book title, author and
@@ -72,7 +76,7 @@ AI features are optional and use API keys that you provide (stored encrypted on-
 | Persistence | Room 2.8.4 (9 entities, exported schemas), DataStore Preferences 1.1.7 |
 | Background work | WorkManager 2.11.1 (wallpaper rotation), broadcast receivers for boot/unlock |
 | Security | AndroidX Security Crypto 1.1.0 (`EncryptedSharedPreferences` / `MasterKey`) for API keys and wallpaper settings |
-| Documents | pdfbox-android 2.0.27.0 (PDF), epublib-core 3.1 + Jsoup 1.19.1 (EPUB), AndroidX DocumentFile 1.0.1 |
+| Documents | Android `PdfRenderer` (page rendering), pdfbox-android 2.0.27.0 (PDF metadata/text), epublib-core 3.1 + Jsoup 1.19.1 (EPUB), AndroidX DocumentFile 1.0.1 |
 | Networking | OkHttp 4.12.0 (AI providers, model discovery, Edge TTS WebSockets) |
 | Build | Android Gradle Plugin 9.5.1, Gradle 9.6.0 wrapper, KSP 2.2.10-2.0.2, JDK 25 toolchain via the Foojay resolver |
 | Tests | JUnit 4, AndroidX JUnit / Espresso 3.7.0, Compose UI Test |
