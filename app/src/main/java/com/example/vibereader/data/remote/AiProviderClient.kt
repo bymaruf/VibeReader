@@ -1,6 +1,7 @@
 package com.example.vibereader.data.remote
 
 import android.util.Log
+import com.example.vibereader.domain.prompt.AiResponseSanitizer
 import com.example.vibereader.model.AiProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -38,15 +39,6 @@ object AiProviderClient {
     private const val DEFAULT_ANTHROPIC_MAX_TOKENS = 4096
     private const val MAX_JSON_TEXT_DEPTH = 4
     private val CONTENT_TEXT_FIELDS = listOf("text", "content")
-    private val THINK_BLOCK = Regex(
-        "<think\\b[^>]*>.*?</think\\s*>",
-        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-    )
-    private val THINK_UNCLOSED = Regex(
-        "<think\\b[^>]*>.*",
-        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-    )
-    private val THINK_TAG = Regex("</?think\\b[^>]*>", RegexOption.IGNORE_CASE)
     private const val APP_REFERER = "https://github.com/VibeReader"
     private const val APP_TITLE = "VibeReader"
     private val OPENCODE_MODEL_PREFIX =
@@ -158,9 +150,9 @@ object AiProviderClient {
             continuation.invokeOnCancellation { cancel() }
             enqueue(
                 object : Callback {
-                    override fun onFailure(call: Call, error: IOException) {
+                    override fun onFailure(call: Call, e: IOException) {
                         if (continuation.isActive) {
-                            continuation.resumeWithException(error)
+                            continuation.resumeWithException(e)
                         }
                     }
 
@@ -364,7 +356,12 @@ object AiProviderClient {
 
             is JSONObject -> {
                 val type = value.optString("type")
-                if (type.isNotBlank() && !type.equals("text", ignoreCase = true)) {
+                // Gemini/OpenAI-compatible gateways can mark a content part as
+                // internal reasoning with `"thought": true` even when it looks
+                // like an ordinary text block. Never read those parts.
+                if (value.optBoolean("thought", false)) {
+                    null
+                } else if (type.isNotBlank() && !type.equals("text", ignoreCase = true)) {
                     null
                 } else {
                     CONTENT_TEXT_FIELDS
@@ -378,16 +375,19 @@ object AiProviderClient {
         }
     }
 
-    private fun cleanedModelText(raw: String): String? = raw
-        .replace(THINK_BLOCK, " ")
-        .replace(THINK_UNCLOSED, " ")
-        .replace(THINK_TAG, " ")
-        .trim()
-        .takeIf {
-            it.isNotEmpty() &&
-                !it.equals("null", ignoreCase = true) &&
-                !it.equals("undefined", ignoreCase = true)
-        }
+    /**
+     * One final sanitizer pass shared with the quote parser and Reader UI.
+     * Removes `<think>`/`<thought>`/`[THOUGHT]` blocks, markdown fences, and
+     * conversational preambles before any caller can display or parse text.
+     */
+    private fun cleanedModelText(raw: String): String? =
+        AiResponseSanitizer.sanitize(raw)
+            .trim()
+            .takeIf {
+                it.isNotEmpty() &&
+                    !it.equals("null", ignoreCase = true) &&
+                    !it.equals("undefined", ignoreCase = true)
+            }
 }
 
 class AiProviderHttpException(

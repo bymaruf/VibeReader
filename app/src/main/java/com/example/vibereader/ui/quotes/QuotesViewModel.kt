@@ -158,7 +158,7 @@ class QuotesViewModel(
      * Emits after a batch approval/delete or a new approved insert so the
      * Wallpaper Studio carousel can append/drop previews immediately.
      */
-    private val _quoteEvents = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    private val _quoteEvents = MutableSharedFlow<Unit>(extraBufferCapacity = 64)
     val quoteEvents = _quoteEvents.asSharedFlow()
 
     private var fetchJob: Job? = null
@@ -308,7 +308,8 @@ class QuotesViewModel(
     }
 
     // -------------------------------------------------------------------------------------
-    // Endless AI quote fetching (human-in-the-loop: all new quotes start unapproved)
+    // Endless AI quote fetching. Wallpaper Studio passes approveForWallpaper=true,
+    // so every valid inserted quote becomes a carousel card immediately.
     // -------------------------------------------------------------------------------------
 
     fun startFetchingQuotes(bookIds: Set<String>) {
@@ -329,60 +330,116 @@ class QuotesViewModel(
                     return@launch
                 }
                 var roundRobinIndex = 0
+                val zeroYieldAttempts = mutableMapOf<String, Int>()
 
                 while (isActive) {
-                    val book = books[roundRobinIndex % books.size]
+                    val availableBooks = books.filter { book ->
+                        (zeroYieldAttempts[book.id] ?: 0) < MAX_ZERO_YIELD_ATTEMPTS
+                    }
+                    if (availableBooks.isEmpty()) {
+                        postUiError(
+                            "No new quotes found after $MAX_ZERO_YIELD_ATTEMPTS attempts " +
+                                "per book. Try another book or check your AI API key in Settings.",
+                            exception = null,
+                            toast = true,
+                        )
+                        return@launch
+                    }
+                    val book = availableBooks[roundRobinIndex % availableBooks.size]
                     roundRobinIndex++
                     val title = displayTitle(book)
                     val author = book.author?.takeIf(String::isNotBlank)
-                    val existing = database.quoteDao().observeAll()
-                        .first()
-                        .asSequence()
-                        .filter { it.bookId == book.id }
-                        .map { it.selectedText }
-                        .toList()
 
-                    try {
-                        val result = aiRepository.fetchAndPersistQuotes(
-                            bookId = book.id,
-                            bookTitle = title,
-                            bookAuthor = author,
-                            chapter = null,
-                            batchSize = AiQuoteRepository.DEFAULT_BATCH_SIZE,
-                            alreadyCollected = existing,
-                            onQuotePersisted = {
-                                // Real-time progress: increment as each row is saved.
-                                _newQuotesFetchedCount.update { current -> current + 1 }
-                            },
-                        )
-                        if (result.insertedCount > 0) {
+                    // Walk several non-overlapping chapters/page windows per
+                    // book so one session produces a rich wallpaper queue
+                    // while the counter ticks after every chunk.
+                    for (chunkIndex in 0 until CHUNKS_PER_BOOK) {
+                        if (!isActive) return@launch
+                        val attemptsSoFar = zeroYieldAttempts[book.id] ?: 0
+                        if (attemptsSoFar >= MAX_ZERO_YIELD_ATTEMPTS) break
+                        val existing = database.quoteDao().observeAll()
+                            .first()
+                            .asSequence()
+                            .filter { it.bookId == book.id }
+                            .map { it.selectedText }
+                            .toList()
+
+                        try {
+                            val result = aiRepository.fetchAndPersistQuotes(
+                                bookId = book.id,
+                                bookTitle = title,
+                                bookAuthor = author,
+                                chapter = null,
+                                batchSize = AiQuoteRepository.DEFAULT_BATCH_SIZE,
+                                alreadyCollected = existing,
+                                approveForWallpaper = true,
+                                chunkIndex = chunkIndex,
+                                chunkCount = CHUNKS_PER_BOOK,
+                                // Fire immediately after every real Room insert
+                                // so the counter and carousel tick during the
+                                // chunk, not only after the whole batch.
+                                onQuotePersisted = {
+                                    _newQuotesFetchedCount.update { current -> current + 1 }
+                                    _quoteEvents.tryEmit(Unit)
+                                },
+                            )
+                            if (result.insertedCount > 0) {
+                                zeroYieldAttempts.remove(book.id)
+                                postInlineMessage(
+                                    "Fetched ${result.insertedCount} new quote(s) from " +
+                                        "$title · total ${_newQuotesFetchedCount.value}. " +
+                                        "Existing approvals kept.",
+                                )
+                            } else {
+                                val attempts = attemptsSoFar + 1
+                                zeroYieldAttempts[book.id] = attempts
+                                if (attempts < MAX_ZERO_YIELD_ATTEMPTS) {
+                                    postInlineMessage(
+                                        "No new quotes from $title " +
+                                            "(attempt $attempts/$MAX_ZERO_YIELD_ATTEMPTS); " +
+                                            "trying another section…",
+                                    )
+                                } else {
+                                    postInlineMessage(
+                                        "No new quotes from $title after " +
+                                            "$MAX_ZERO_YIELD_ATTEMPTS attempts; skipping it.",
+                                    )
+                                }
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (config: AiConfigurationException) {
+                            // Missing key/model — surface clearly and stop the loop.
+                            Log.e(AI_ERROR_TAG, "Execution error", config)
+                            postUiError(config.message, config, toast = true)
+                            return@launch
+                        } catch (request: AiRequestException) {
+                            logRequestError(request)
+                            if (request.stopBackgroundFetch) {
+                                // Auth/quota/timeout after the whole healthy pool
+                                // was tried. Stop cleanly instead of spinning.
+                                postUiError(request.toUiMessage(), request, toast = true)
+                                return@launch
+                            }
+                            // A model returned unusable output, not an exhausted
+                            // key. Keep this book moving through its other chunks.
                             postInlineMessage(
-                                "Fetched ${result.insertedCount} new quote(s) from " +
-                                    "$title · total ${_newQuotesFetchedCount.value}. " +
-                                    "Existing approvals kept.",
+                                "AI returned no usable quotes for one section of " +
+                                    "$title; trying another section…",
+                            )
+                        } catch (error: Throwable) {
+                            // Network, JSON, or unexpected failures must never hang
+                            // the UI. One bad book must not abort every selected book.
+                            Log.e(AI_ERROR_TAG, "Execution error", error)
+                            val attempts = attemptsSoFar + 1
+                            zeroYieldAttempts[book.id] = attempts
+                            postInlineMessage(
+                                "Could not read a quote section of $title " +
+                                    "(${error.localizedMessage ?: "unknown error"}); " +
+                                    "trying another section…",
                             )
                         }
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (config: AiConfigurationException) {
-                        // Missing key/model — surface clearly and stop the loop.
-                        Log.e(AI_ERROR_TAG, "Execution error", config)
-                        postUiError(config.message, config, toast = true)
-                        return@launch
-                    } catch (request: AiRequestException) {
-                        // 401/429/network/other errors after the whole failover pool
-                        // was exhausted. Log full details and keep looping so a
-                        // transient provider outage can recover.
-                        logRequestError(request)
-                        postUiError(request.toUiMessage(), request, toast = true)
-                    } catch (error: Throwable) {
-                        // Network, JSON, or unexpected failures must never hang the UI.
-                        Log.e(AI_ERROR_TAG, "Execution error", error)
-                        postUiError(
-                            error.localizedMessage ?: "Fetching quotes failed unexpectedly.",
-                            error,
-                            toast = true,
-                        )
+                        if (!isActive) return@launch
                     }
                 }
             } catch (cancelled: CancellationException) {
@@ -401,16 +458,20 @@ class QuotesViewModel(
     }
 
     /**
-     * Stops the endless fetch loop. The live session count is reset so the next
-     * explicit "Fetch AI Quotes" session starts from 0 (previously saved quotes
-     * remain in the library).
+     * Stops the endless fetch loop. The live session count is preserved so the
+     * button can report how many wallpapers were created; the next explicit
+     * fetch starts a fresh session from 0.
      */
     fun stopFetchingQuotes() {
         fetchJob?.cancel()
         fetchJob = null
         _isFetchingQuotes.value = false
-        _newQuotesFetchedCount.value = 0
-        _message.value = "Stopped fetching quotes."
+        val created = _newQuotesFetchedCount.value
+        _message.value = if (created > 0) {
+            "Stopped fetching · $created new wallpapers created."
+        } else {
+            "Stopped fetching quotes."
+        }
     }
 
     fun clearMessage() {
@@ -566,10 +627,23 @@ class QuotesViewModel(
     }
 
     private fun AiRequestException.toUiMessage(): String = when {
+        statusCode == 401 || statusCode == 403 ->
+            "API key rejected. Check your AI API key in Settings."
+
+        statusCode == 429 -> "Rate limited — try again shortly."
+        statusCode != null && statusCode in 500..599 ->
+            "AI provider is unavailable right now. Try again shortly."
+
+        statusCode != null ->
+            "${provider?.shortLabel ?: provider?.displayName ?: "AI"} failed (HTTP $statusCode): " +
+                (message ?: "request error")
+
+        message?.contains("timed out", ignoreCase = true) == true ->
+            "AI request timed out. Check your internet connection and try again."
+
         message == AiFailoverManager.ALL_KEYS_FAILED_MESSAGE -> message.orEmpty()
-        statusCode != null -> "${provider?.shortLabel ?: provider?.displayName ?: "AI"} failed (HTTP $statusCode): " +
-            (message ?: "request error")
-        else -> "${provider?.shortLabel ?: provider?.displayName ?: "AI"} error: ${message ?: "request failed"}"
+        else -> "${provider?.shortLabel ?: provider?.displayName ?: "AI"} error: " +
+            (message ?: "request failed")
     }
 
     class Factory(
@@ -587,5 +661,13 @@ class QuotesViewModel(
 
     private companion object {
         const val AI_ERROR_TAG = "VibeReader_AI"
+
+        /**
+         * One full eight-chunk pass over a book before it is parked. The old
+         * value of 3 skipped the fourth chunk, so a book could never be fully
+         * sampled even though four chunks were requested.
+         */
+        const val MAX_ZERO_YIELD_ATTEMPTS = 8
+        const val CHUNKS_PER_BOOK = 8
     }
 }

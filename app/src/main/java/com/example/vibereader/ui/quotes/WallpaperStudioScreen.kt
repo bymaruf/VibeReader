@@ -55,7 +55,9 @@ fun WallpaperStudioScreen() {
 
     LaunchedEffect(pagerState.currentPage, wallpapers.size) {
         if (wallpapers.size > 0 && pagerState.currentPage >= wallpapers.size - 2) {
-            viewModel.generateBatch(wallpapers.size + 4)
+            // Append a couple of new previews instead of re-rendering the
+            // whole carousel every time the pager approaches the end.
+            viewModel.loadMoreWallpapers()
         }
     }
 

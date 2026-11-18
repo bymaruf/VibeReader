@@ -20,6 +20,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -121,13 +122,36 @@ fun ReaderSettingsBottomSheet(
                     onValueChange = { onSettingsChange(settings.copy(lineHeightMultiplier = it)) },
                 )
             }
-            SettingSlider(
-                label = "Page margins",
-                valueLabel = "${settings.marginDp.toInt()} dp",
-                value = settings.marginDp,
-                valueRange = 0f..40f,
-                onValueChange = { onSettingsChange(settings.copy(marginDp = it)) },
-            )
+            if (isPdf) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Crop whitespace", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            "Auto-trim empty page margins",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = settings.cropPdfWhitespace,
+                        onCheckedChange = { checked ->
+                            onSettingsChange(settings.copy(cropPdfWhitespace = checked))
+                        },
+                    )
+                }
+            } else {
+                SettingSlider(
+                    label = "Page margins",
+                    valueLabel = "${settings.marginDp.toInt()} dp",
+                    value = settings.marginDp,
+                    valueRange = 0f..40f,
+                    onValueChange = { onSettingsChange(settings.copy(marginDp = it)) },
+                )
+            }
         }
     }
 }

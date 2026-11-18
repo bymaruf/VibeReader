@@ -15,6 +15,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import com.example.vibereader.model.ReadingTheme
 import com.example.vibereader.util.PdfColorMatrix
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 
 @Composable
 fun PdfPageRenderer(
@@ -22,6 +24,7 @@ fun PdfPageRenderer(
     bitmap: Bitmap?,
     title: String,
     theme: ReadingTheme,
+    cropPdfWhitespace: Boolean = false,
     selection: ReaderSelection?,
     speechSelection: ReaderSelection?,
     savedHighlights: List<com.example.vibereader.data.room.HighlightEntity>,
@@ -44,6 +47,8 @@ fun PdfPageRenderer(
     ) -> Unit,
     onHighlightTap: (com.example.vibereader.data.room.HighlightEntity) -> Unit,
     onZoomChanged: (Float) -> Unit,
+    zoomEnabled: Boolean = true,
+    zoomResetToken: Int = 0,
 ) {
     val backgroundColor = when (theme) {
         ReadingTheme.SYSTEM -> if (isSystemInDarkTheme()) Color(0xFF121212) else Color.White
@@ -74,9 +79,22 @@ fun PdfPageRenderer(
         ) {
             val availableWidthPx = constraints.maxWidth
             val availableHeightPx = constraints.maxHeight.takeIf { constraints.hasBoundedHeight } ?: 0
-            LaunchedEffect(pageIndex, availableWidthPx, availableHeightPx) {
-                if (availableWidthPx > 0) {
+            val awaitingBitmap = bitmap == null
+            LaunchedEffect(
+                pageIndex,
+                availableWidthPx,
+                availableHeightPx,
+                cropPdfWhitespace,
+                awaitingBitmap,
+            ) {
+                if (!awaitingBitmap || availableWidthPx <= 0) return@LaunchedEffect
+                // Keep retrying while the slot is empty. Rendering can be
+                // skipped by an in-flight duplicate or fail transiently; a
+                // single fire-and-forget request would leave the item spinning
+                // forever with no further trigger.
+                while (isActive) {
                     onRenderPage(pageIndex, availableWidthPx, availableHeightPx, 1f)
+                    delay(1_500L)
                 }
             }
 
@@ -121,6 +139,8 @@ fun PdfPageRenderer(
                             )
                         }
                     },
+                    zoomEnabled = zoomEnabled,
+                    zoomResetToken = zoomResetToken,
                 )
             }
         }

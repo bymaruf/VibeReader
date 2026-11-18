@@ -33,6 +33,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.example.vibereader.domain.prompt.AiResponseSanitizer
 import com.example.vibereader.model.ReaderTtsVoice
 import com.example.vibereader.ui.reader.AiTaskResult
 import com.example.vibereader.util.FreeAiTtsPlayer
@@ -310,18 +311,38 @@ fun AiAssistantBottomSheet(
                             color = contentColor,
                         )
                         Text(
-                            text = result.content,
+                            // Defence in depth: even a cached/replayed answer
+                            // from an older app version is stripped of thinking
+                            // tags, fences, Markdown, and conversational
+                            // preambles here.
+                            text = remember(result.content) {
+                                AiResponseSanitizer.sanitizeForDisplay(result.content)
+                            },
                             style = MaterialTheme.typography.bodyMedium,
                             color = contentColor,
                         )
-                        TextButton(
-                            onClick = onDismissAiResult,
-                            modifier = Modifier.align(Alignment.End),
-                            colors = ButtonDefaults.textButtonColors(
-                                contentColor = contentColor,
-                            ),
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End,
                         ) {
-                            Text("Dismiss")
+                            if (result.isError && result.retry != null) {
+                                TextButton(
+                                    onClick = { result.retry.invoke() },
+                                    colors = ButtonDefaults.textButtonColors(
+                                        contentColor = contentColor,
+                                    ),
+                                ) {
+                                    Text("Retry")
+                                }
+                            }
+                            TextButton(
+                                onClick = onDismissAiResult,
+                                colors = ButtonDefaults.textButtonColors(
+                                    contentColor = contentColor,
+                                ),
+                            ) {
+                                Text("Dismiss")
+                            }
                         }
                     }
                 }

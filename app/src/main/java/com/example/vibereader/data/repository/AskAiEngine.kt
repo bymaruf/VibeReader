@@ -6,6 +6,7 @@ import com.example.vibereader.core.database.VibeReaderDatabase
 import com.example.vibereader.data.local.AiKeyVault
 import com.example.vibereader.domain.prompt.AiContextSanitizer
 import com.example.vibereader.domain.prompt.AiPromptTemplates
+import com.example.vibereader.domain.prompt.AiResponseSanitizer
 import com.example.vibereader.domain.prompt.BookQuestionScope
 import com.example.vibereader.domain.prompt.LocalKeywordRetriever
 import kotlinx.coroutines.CancellationException
@@ -37,8 +38,8 @@ class AskAiEngine(
     private val keyVault: AiKeyVault = AiKeyVault(context.applicationContext),
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
         .callTimeout(75, TimeUnit.SECONDS)
         .build(),
     private val responseCache: AiResponseCache = AiResponseCache(
@@ -160,8 +161,10 @@ class AskAiEngine(
                         return@executeAi it
                     }
             }
-            metadataFailure?.let { throw it }
 
+            // A metadata failure is remembered only to explain the case where
+            // local retrieval has no text. When snippets exist, the RAG request
+            // below gets its own independent failover sweep.
             logFailoverPool()
             val systemPrompt = AiPromptTemplates.buildBookRagSystemPrompt(
                 bookTitle = bookTitle,
@@ -402,11 +405,12 @@ class AskAiEngine(
      * error is logged with the required `VibeReader_AI` tag and rethrown as a
      * user-facing exception for the Reader UI.
      */
-    private fun String.usableAiTextOrNull(): String? = trim().takeIf {
-        it.isNotEmpty() &&
-            !it.equals("null", ignoreCase = true) &&
-            !it.equals("undefined", ignoreCase = true)
-    }
+    private fun String.usableAiTextOrNull(): String? =
+        AiResponseSanitizer.sanitize(this).trim().takeIf {
+            it.isNotEmpty() &&
+                !it.equals("null", ignoreCase = true) &&
+                !it.equals("undefined", ignoreCase = true)
+        }
 
     private suspend fun <T> executeAi(
         label: String,

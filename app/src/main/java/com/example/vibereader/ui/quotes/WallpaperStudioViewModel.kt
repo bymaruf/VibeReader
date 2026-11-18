@@ -32,6 +32,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 
 class WallpaperStudioViewModel(
     context: Context,
@@ -74,6 +75,12 @@ class WallpaperStudioViewModel(
 
     /** Serializes approval syncs so rapid checkbox taps cannot lose updates. */
     private val approvalSyncMutex = Mutex()
+
+    /**
+     * Set when an approval/fetch event arrives while a render is in progress.
+     * The event is replayed after the render finishes instead of being dropped.
+     */
+    private val pendingApprovalSync = AtomicBoolean(false)
 
     /** Round-robin cursor for "load more" across the selected books. */
     private var loadMoreCursor = 0
@@ -186,6 +193,7 @@ class WallpaperStudioViewModel(
                 if (requestId == themeRenderRequestId) {
                     _isGenerating.value = false
                 }
+                flushPendingApprovalSync()
             }
         }
     }
@@ -199,6 +207,7 @@ class WallpaperStudioViewModel(
     private suspend fun reRenderWallpaper(
         wallpaper: TypographyWallpaper,
         isDark: Boolean,
+        fullResolution: Boolean = false,
     ): TypographyWallpaper {
         val bitmap = TypographyWallpaperGenerator.generateWallpaperBitmap(
             context = appContext,
@@ -208,6 +217,7 @@ class WallpaperStudioViewModel(
             bookAuthor = wallpaper.bookAuthor,
             layoutVariant = wallpaper.layoutVariant,
             isDarkMode = isDark,
+            outputScale = if (fullResolution) 1f else PREVIEW_OUTPUT_SCALE,
         )
         return wallpaper.copy(
             theme = if (isDark) WallpaperTheme.DARK else WallpaperTheme.LIGHT,
@@ -247,6 +257,7 @@ class WallpaperStudioViewModel(
                 _error.value = e.localizedMessage ?: "Failed to generate wallpaper batch."
             } finally {
                 _isGenerating.value = false
+                flushPendingApprovalSync()
             }
         }
     }
@@ -258,67 +269,67 @@ class WallpaperStudioViewModel(
      * carousel became empty.
      */
     fun syncWallpapersWithApprovals() {
+        if (_isGenerating.value) {
+            // Never drop a burst of newly approved quotes just because a theme
+            // render or apply is still running.
+            pendingApprovalSync.set(true)
+            return
+        }
         viewModelScope.launch {
             approvalSyncMutex.withLock {
-                if (_isGenerating.value) return@withLock
-                val approvedQuotes = quoteRepository.observeApproved().first()
-                val approvedTexts = approvedQuotes
-                    .map { it.selectedText }
-                    .filter(QuoteQualityValidator::isValidQuote)
-                    .toSet()
-                val filtered = _wallpapers.value.filter { it.quote in approvedTexts }
-                if (approvedTexts.isEmpty()) {
-                    _wallpapers.value = emptyList()
+                if (_isGenerating.value) {
+                    pendingApprovalSync.set(true)
                     return@withLock
                 }
-                if (filtered.isEmpty()) {
-                    // First approval: render just that quote (one page).
-                    // Generating eight duplicates of the same quote is what
-                    // made the carousel feel stagnant; further approvals are
-                    // appended one by one below.
-                    val firstApproved = approvedQuotes.firstOrNull {
-                        it.selectedText in approvedTexts
+                try {
+                    val approvedQuotes = quoteRepository.observeApproved().first()
+                    val usableApproved = approvedQuotes
+                        .filter { QuoteQualityValidator.isValidQuote(it.selectedText) }
+                    val approvedTexts = usableApproved
+                        .map { it.selectedText }
+                        .toSet()
+                    val filtered = _wallpapers.value.filter { it.quote in approvedTexts }
+                    if (usableApproved.isEmpty()) {
+                        _wallpapers.value = emptyList()
+                        return@withLock
                     }
-                    val wallpaper = firstApproved?.let { quote ->
+
+                    // Auto-approved fetch results arrive in bursts. Append every
+                    // newly approved quote (not just one) so each fetched quote
+                    // becomes a swipeable card immediately, up to the carousel
+                    // memory cap.
+                    val represented = filtered.map { it.quote }.toSet()
+                    val missing = usableApproved
+                        .filter { it.selectedText !in represented }
+                        .distinctBy { it.selectedText }
+                    val slots = (MAX_CAROUSEL_WALLPAPERS - filtered.size).coerceAtLeast(0)
+                    val appended = mutableListOf<TypographyWallpaper>()
+                    for (quote in missing.take(slots)) {
                         try {
-                            buildWallpaperForQuote(quote, _isDarkMode.value)
+                            buildWallpaperForQuote(quote, _isDarkMode.value)?.let(appended::add)
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (error: Exception) {
                             _error.value = error.localizedMessage
                                 ?: "Could not render the approved quote."
-                            null
                         }
                     }
-                    _wallpapers.value = ensureCurrentTheme(listOfNotNull(wallpaper))
-                    return@withLock
+                    _wallpapers.value = ensureCurrentTheme(filtered + appended)
+                } finally {
+                    flushPendingApprovalSync()
                 }
-
-                // Approving a second quote should add it to the carousel right
-                // away instead of waiting for a manual refresh. The cap
-                // prevents 25 approvals from allocating 25 full-screen
-                // bitmaps and risking an OutOfMemoryError.
-                if (filtered.size >= MAX_CAROUSEL_WALLPAPERS) {
-                    _wallpapers.value = filtered
-                    return@withLock
-                }
-                val represented = filtered.map { it.quote }.toSet()
-                val newlyApproved = approvedQuotes.firstOrNull {
-                    it.selectedText in approvedTexts && it.selectedText !in represented
-                }
-                val appended = newlyApproved?.let { quote ->
-                    try {
-                        buildWallpaperForQuote(quote, _isDarkMode.value)
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (error: Exception) {
-                        _error.value = error.localizedMessage
-                            ?: "Could not render the newly approved quote."
-                        null
-                    }
-                }
-                _wallpapers.value = filtered + ensureCurrentTheme(listOfNotNull(appended))
             }
+        }
+    }
+
+    /**
+     * Replays an approval event that arrived during a render. Must be called
+     * from a non-busy state; the next sync takes the mutex normally.
+     */
+    private fun flushPendingApprovalSync() {
+        if (_isGenerating.value) return
+        if (pendingApprovalSync.getAndSet(false)) {
+            syncWallpapersWithApprovals()
         }
     }
 
@@ -346,6 +357,7 @@ class WallpaperStudioViewModel(
             bookAuthor = document.author,
             layoutVariant = variant,
             isDarkMode = isDark,
+            outputScale = PREVIEW_OUTPUT_SCALE,
         )
         TypographyWallpaper(
             id = "${book.id}-w$variantIndex",
@@ -378,13 +390,19 @@ class WallpaperStudioViewModel(
                 val books = resolveTargetBooks()
                 if (books.isEmpty()) return@launch
                 val book = books[loadMoreCursor % books.size]
+                val remainingSlots =
+                    (MAX_CAROUSEL_WALLPAPERS - _wallpapers.value.size).coerceAtLeast(0)
+                if (remainingSlots == 0) return@launch
+                val representedQuotes = _wallpapers.value
+                    .mapTo(mutableSetOf()) { it.quote }
                 val added = ensureCurrentTheme(
                     buildWallpapersForBook(
                         book = book,
-                        count = LOAD_MORE_COUNT,
+                        count = LOAD_MORE_COUNT.coerceAtMost(remainingSlots),
                         isDark = _isDarkMode.value,
+                        excludeQuotes = representedQuotes,
                     ),
-                )
+                ).take(remainingSlots)
                 _wallpapers.value = _wallpapers.value + added
                 loadMoreCursor++
             } catch (cancelled: CancellationException) {
@@ -393,6 +411,7 @@ class WallpaperStudioViewModel(
                 _error.value = e.localizedMessage ?: "Could not fetch more wallpaper quotes."
             } finally {
                 _isLoadingMore.value = false
+                flushPendingApprovalSync()
             }
         }
     }
@@ -407,13 +426,13 @@ class WallpaperStudioViewModel(
                 // the system wallpaper matches the toggle.
                 var appliedTheme = _isDarkMode.value
                 var rendered = withContext(Dispatchers.Default) {
-                    reRenderWallpaper(wallpaper, appliedTheme)
+                    reRenderWallpaper(wallpaper, appliedTheme, fullResolution = true)
                 }
                 val latestTheme = _isDarkMode.value
                 if (latestTheme != appliedTheme) {
                     appliedTheme = latestTheme
                     rendered = withContext(Dispatchers.Default) {
-                        reRenderWallpaper(wallpaper, appliedTheme)
+                        reRenderWallpaper(wallpaper, appliedTheme, fullResolution = true)
                     }
                 }
                 val bitmap = rendered.bitmap
@@ -441,6 +460,7 @@ class WallpaperStudioViewModel(
                 _error.value = error.localizedMessage ?: "Could not set wallpaper."
             } finally {
                 _isGenerating.value = false
+                flushPendingApprovalSync()
             }
         }
     }
@@ -450,14 +470,20 @@ class WallpaperStudioViewModel(
         if (books.isEmpty()) {
             throw IOException("Pick a book or save a quote while reading first.")
         }
+        // "Refresh Batch" must not shrink a rich fetched carousel back to the
+        // default eight cards. Keep at least the current card count, but clamp
+        // it: preview bitmaps are lightweight, yet the list still needs a hard
+        // ceiling so a long reading session cannot exhaust the heap.
+        val targetCount = maxOf(batchSize, _wallpapers.value.size)
+            .coerceIn(1, MAX_CAROUSEL_WALLPAPERS)
         val generated = mutableListOf<TypographyWallpaper>()
         var round = 0
-        while (generated.size < batchSize) {
-            val remaining = batchSize - generated.size
+        while (generated.size < targetCount) {
+            val remaining = targetCount - generated.size
             val perBook = if (books.size == 1) remaining else (remaining / books.size).coerceAtLeast(1)
             for (book in books) {
-                if (generated.size >= batchSize) break
-                val count = perBook.coerceAtMost(batchSize - generated.size)
+                if (generated.size >= targetCount) break
+                val count = perBook.coerceAtMost(targetCount - generated.size)
                 try {
                     generated += buildWallpapersForBook(
                         book = book,
@@ -485,6 +511,8 @@ class WallpaperStudioViewModel(
         book: BookEntity,
         count: Int,
         isDark: Boolean,
+        /** Quotes already shown in the pager; avoids duplicate load-more cards. */
+        excludeQuotes: Set<String> = emptySet(),
     ): List<TypographyWallpaper> = withContext(Dispatchers.Default) {
         val document = loadBookDocument(book)
         // Human-in-the-loop stage 2: render ONLY user-approved quotes.
@@ -494,6 +522,10 @@ class WallpaperStudioViewModel(
                 "No approved quotes for ${FilenameSanitizer.cleanBookTitle(book.title)} yet.",
             )
         }
+        // Prefer quotes not yet on screen. When every approved quote is already
+        // represented, cycle through them rather than returning zero cards.
+        val queue = usableQuotes.filterNot { it in excludeQuotes }
+            .ifEmpty { usableQuotes }
 
         val variants = WallpaperLayoutVariant.entries
         val theme = if (isDark) WallpaperTheme.DARK else WallpaperTheme.LIGHT
@@ -503,7 +535,7 @@ class WallpaperStudioViewModel(
             val variantIndex = nextVariantIndex
             nextVariantIndex++
             val progress = getProgressText(book)
-            val quote = usableQuotes[index % usableQuotes.size]
+            val quote = queue[index % queue.size]
             val bitmap = TypographyWallpaperGenerator.generateWallpaperBitmap(
                 context = appContext,
                 quote = quote,
@@ -512,6 +544,7 @@ class WallpaperStudioViewModel(
                 bookAuthor = document.author,
                 layoutVariant = variant,
                 isDarkMode = isDark,
+                outputScale = PREVIEW_OUTPUT_SCALE,
             )
             TypographyWallpaper(
                 id = "${book.id}-w$variantIndex",
@@ -623,8 +656,16 @@ class WallpaperStudioViewModel(
     companion object {
         const val DEFAULT_BATCH_SIZE = 8
         const val LOAD_MORE_COUNT = 2
-        /** Hard cap on decoded full-screen bitmaps held by the carousel. */
-        private const val MAX_CAROUSEL_WALLPAPERS = 12
+
+        /**
+         * Carousel cards render at 40% of the canonical 1080x2400 canvas.
+         * Applying a wallpaper re-renders the same quote at full resolution,
+         * so preview memory stays flat while the pager can show 30+ cards.
+         */
+        private const val PREVIEW_OUTPUT_SCALE = 0.4f
+
+        /** Hard cap on carousel cards; 40 previews still covers "30+ new". */
+        private const val MAX_CAROUSEL_WALLPAPERS = 40
         private const val RETRY_ROUNDS = 4
     }
 }

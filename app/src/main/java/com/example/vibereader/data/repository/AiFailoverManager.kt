@@ -73,6 +73,13 @@ class AiRequestException(
      */
     val allKeysExhausted: Boolean = false,
     /**
+     * True when every candidate answered, but the answers were unusable (for
+     * example malformed JSON or no valid quotes). This is a model/output
+     * problem, not an auth/quota problem; callers should not tell the user
+     * that every key is out of quota.
+     */
+    val responseRejected: Boolean = false,
+    /**
      * Terminal failure for the current background operation. Always true for
      * [allKeysExhausted]; also true for timeouts and unusable responses where
      * an immediate automatic retry would simply repeat the same failure.
@@ -191,9 +198,9 @@ object AiRuntimeResolver {
             // CLI/client-restricted OpenCode models must never reach the REST
             // endpoint, even if an older build persisted one as the active
             // model. Fall back to the provider's REST-safe default instead.
-            // A build-time Gemini pool (including the legacy single-key
-            // fallback) must also work without a Settings visit. Providers
-            // without build-time keys still require an explicitly saved model.
+            // A saved API key is enough to join the failover pool: when the
+            // user has not visited the model picker, the provider's active
+            // default model is used automatically.
             val model = when {
                 provider == AiProvider.OPENCODE &&
                     OpenCodeModelPolicy.isRestrictedModel(savedModel) -> {
@@ -209,7 +216,11 @@ object AiRuntimeResolver {
 
                 savedModel.isNotBlank() -> savedModel
 
-                buildTimeKeys.isNotEmpty() ->
+                // A saved key is enough to auto-select the provider's active
+                // default model. This is what lets a user add a Groq/OpenAI
+                // key without first running model discovery, and what makes
+                // failover work when the saved model is later deprecated.
+                config.apiKey.isNotBlank() || buildTimeKeys.isNotEmpty() ->
                     AiProviderClient.normalizeModelId(provider, provider.defaultModel)
 
                 else -> ""
@@ -360,18 +371,22 @@ object AiRuntimeResolver {
  *   build-time pool this gives `key 0 -> key 1 -> key 2 -> key 0` ordering
  *   instead of hammering the first key.
  * - HTTP 429 places only that key on a 60-second [keyCooldowns] entry and the
- *   request immediately advances to the next key. Cooldowns are purged
- *   automatically when they expire, so no app restart is required.
- * - HTTP 401/403 permanently disables that key for the process session
- *   ([disabledKeys]); it is never selected again until the app restarts.
+ *   request immediately advances to the next key. HTTP 503 is treated as an
+ *   overloaded gateway and parked for the same short window instead of being
+ *   retried on the same key.
+ * - HTTP 401/403 puts that key on a ten-minute cooldown instead of permanently
+ *   discarding it. A revoked key is never used during the cooldown, but a key
+ *   whose quota resets later rejoins the pool automatically.
  * - Timeouts ([SocketTimeoutException] / [InterruptedIOException]) mark the
  *   stalled provider as temporarily busy and fail over immediately to the next
- *   provider/key. Other network IO failures and 5xx responses get up to two
- *   exponential backoff retries on the same key before the sweep moves on.
- *   Validation failures (for example an unusable quote payload) advance
- *   immediately.
- * - If every remaining key is on a 429 cooldown, the manager waits for the
- *   earliest expiry and retries rather than surfacing an "all keys failed"
+ *   provider/key. Other network IO failures get up to two exponential backoff
+ *   retries on the same key before the sweep moves on. Validation failures (for
+ *   example an unusable quote payload) advance immediately.
+ * - Candidates are ordered by health (non-cooling, non-busy first) and then by
+ *   the most recent observed latency. Round-robin remains the tie-breaker, so
+ *   one fast key is preferred without starving the rest of the pool.
+ * - If every remaining key is on a short 429/503 cooldown, the manager waits for
+ *   the earliest expiry and retries rather than surfacing an "all keys failed"
  *   error. [ALL_KEYS_FAILED_MESSAGE] is reserved for a pool where every key is
  *   disabled, has failed, or the device is offline.
  *
@@ -398,6 +413,12 @@ object AiFailoverManager {
     /** 429 keys rest for this long before rejoining the rotation. */
     private const val RATE_LIMIT_COOLDOWN_MILLIS = 60_000L
 
+    /** Overloaded (503) gateways are skipped for the same short window. */
+    private const val OVERLOADED_COOLDOWN_MILLIS = 60_000L
+
+    /** 401/403 keys rest for ten minutes instead of being discarded forever. */
+    private const val AUTH_FAILURE_COOLDOWN_MILLIS = 10 * 60_000L
+
     /** 5xx/network failures are retried this many times on the same key. */
     private const val MAX_TRANSIENT_RETRIES = 2
 
@@ -419,8 +440,19 @@ object AiFailoverManager {
      */
     private val providerBusyUntil = ConcurrentHashMap<String, Long>()
 
-    /** Keys disabled for the whole app session after HTTP 401/403. */
-    private val disabledKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    /**
+     * HTTP status that produced the current cooldown. Only short 429/503
+     * cooldowns may be waited for inside one request; a ten-minute 401/403
+     * cooldown must fail over immediately instead of keeping the UI waiting.
+     */
+    private val keyCooldownStatus = ConcurrentHashMap<String, Int>()
+
+    /**
+     * Most recent successful round-trip per key, in milliseconds. Unknown keys
+     * are treated as neutral; entries are best-effort diagnostics used only for
+     * ordering healthy candidates.
+     */
+    private val keyLatencyMillis = ConcurrentHashMap<String, Long>()
 
     /**
      * Last failure observed for each key. A single key that is skipped while
@@ -556,14 +588,20 @@ object AiFailoverManager {
             purgeExpiredProviderBusy()
             // Recently timed-out providers are still tried if every healthy
             // provider fails, but they no longer lead the fallback order.
+            // Among healthy candidates, prefer the fastest recently observed
+            // key; round-robin order is the stable tie-breaker.
             val ordered = roundRobinOrder(attempts)
-                .sortedBy { if (isProviderTemporarilyBusy(it.provider)) 1 else 0 }
+                .sortedWith(
+                    compareBy(
+                        { if (isProviderTemporarilyBusy(it.provider)) 1 else 0 },
+                        { keyLatencyMillis[it.keyIdentity()] ?: Long.MAX_VALUE / 2 },
+                    ),
+                )
 
             for ((index, config) in ordered.withIndex()) {
                 currentCoroutineContext().ensureActive()
                 if (config.provider in timedOutProviders) continue
                 val identity = config.keyIdentity()
-                if (identity in disabledKeys) continue
                 if (isCoolingDown(identity)) continue
                 if (identity in triedKeys && identity !in rateLimitedKeys) continue
 
@@ -572,6 +610,7 @@ object AiFailoverManager {
                 triedKeys += identity
 
                 try {
+                    val startedAtNanos = System.nanoTime()
                     val (text, usedModel) = executeProviderWithRetries(
                         httpClient = httpClient,
                         config = config,
@@ -581,6 +620,9 @@ object AiFailoverManager {
                         temperature = temperature,
                         logTag = logTag,
                     )
+                    keyLatencyMillis[identity] = (
+                        (System.nanoTime() - startedAtNanos) / 1_000_000L
+                        ).coerceAtLeast(1L)
 
                     // Validation failures are attempt failures, not terminal
                     // request failures. Advance to the next provider/key.
@@ -657,6 +699,7 @@ object AiFailoverManager {
                         429 -> {
                             keyCooldowns[identity] = System.currentTimeMillis() +
                                 RATE_LIMIT_COOLDOWN_MILLIS
+                            keyCooldownStatus[identity] = 429
                             rateLimitedKeys += identity
                             Log.w(
                                 logTag,
@@ -666,13 +709,28 @@ object AiFailoverManager {
                             )
                         }
 
+                        503 -> {
+                            keyCooldowns[identity] = System.currentTimeMillis() +
+                                OVERLOADED_COOLDOWN_MILLIS
+                            keyCooldownStatus[identity] = 503
+                            rateLimitedKeys += identity
+                            Log.w(
+                                logTag,
+                                "Provider overloaded (HTTP 503) on " +
+                                    "${config.keyFingerprint()}; cooling down for " +
+                                    "${OVERLOADED_COOLDOWN_MILLIS}ms and trying the next key.",
+                            )
+                        }
+
                         401, 403 -> {
-                            disabledKeys += identity
+                            keyCooldowns[identity] = System.currentTimeMillis() +
+                                AUTH_FAILURE_COOLDOWN_MILLIS
+                            keyCooldownStatus[identity] = error.statusCode
                             Log.w(
                                 logTag,
                                 "Authentication failure (HTTP ${error.statusCode}) on " +
-                                    "${config.keyFingerprint()}; key disabled for this " +
-                                    "app session.",
+                                    "${config.keyFingerprint()}; key cooling down for " +
+                                    "${AUTH_FAILURE_COOLDOWN_MILLIS}ms.",
                             )
                         }
 
@@ -709,7 +767,12 @@ object AiFailoverManager {
             purgeExpiredCooldowns()
             val earliestCooldown = attempts
                 .asSequence()
-                .filter { it.keyIdentity() !in disabledKeys }
+                .filter { config ->
+                    // Only 429/503 cooldowns are short enough to wait for inside
+                    // one request. Auth failures (10m) and deliberate cooldowns
+                    // fail over immediately.
+                    keyCooldownStatus[config.keyIdentity()] in SHORT_COOLDOWN_STATUSES
+                }
                 .mapNotNull { keyCooldowns[it.keyIdentity()] }
                 .filter { it > now }
                 .minOrNull()
@@ -774,6 +837,7 @@ object AiFailoverManager {
         for ((key, until) in keyCooldowns) {
             if (now >= until) {
                 keyCooldowns.remove(key, until)
+                keyCooldownStatus.remove(key)
             }
         }
     }
@@ -782,6 +846,7 @@ object AiFailoverManager {
         val until = keyCooldowns[key] ?: return false
         if (System.currentTimeMillis() >= until) {
             keyCooldowns.remove(key, until)
+            keyCooldownStatus.remove(key)
             return false
         }
         return true
@@ -847,6 +912,11 @@ object AiFailoverManager {
             } catch (timeout: InterruptedIOException) {
                 throw timeout
             } catch (error: Throwable) {
+                // 503 means the gateway itself is overloaded. Retrying the same
+                // key burns the user's remaining timeout; park it and move on.
+                if (error is AiProviderHttpException && error.statusCode == 503) {
+                    throw error
+                }
                 if (!error.isTransientRetryable() || retry >= MAX_TRANSIENT_RETRIES) {
                     throw error
                 }
@@ -956,14 +1026,24 @@ object AiFailoverManager {
         }
 
         val singleConfig = configs.singleOrNull()
+        val timedOut = lastError is SocketTimeoutException ||
+            lastError is InterruptedIOException
+        // A response that reached us but failed caller-side validation is not
+        // an auth/quota failure. Stream-ending network IOException (EOF, reset)
+        // still counts as a transport failure, so terminal remains true there.
+        val responseRejected = lastError != null &&
+            httpError == null &&
+            !timedOut &&
+            lastError !is IOException
         val message = when {
+            responseRejected ->
+                "The AI returned an unusable response. Try another model or provider."
+
             singleConfig == null -> ALL_KEYS_FAILED_MESSAGE
 
             httpError != null -> formatSingleKeyHttpError(httpError)
 
-            lastError is SocketTimeoutException ||
-                lastError is InterruptedIOException ->
-                formatSingleKeyTimeout(singleConfig, lastError)
+            timedOut -> formatSingleKeyTimeout(singleConfig, lastError!!)
 
             lastError != null -> "AI request failed for " +
                 "${singleConfig.provider.displayName}: " +
@@ -977,12 +1057,18 @@ object AiFailoverManager {
             else -> ALL_KEYS_FAILED_MESSAGE
         }
 
+        // Validation failures should let a background loop try a different
+        // chunk/model instead of terminating the whole session with a quota
+        // message. Timeouts are intentionally terminal for the current request.
+        val terminal = !responseRejected
         return AiRequestException(
             message = message,
             provider = (singleConfig ?: configs.lastOrNull())?.provider,
             model = (singleConfig ?: configs.lastOrNull())?.model,
             statusCode = httpError?.statusCode,
-            allKeysExhausted = true,
+            allKeysExhausted = terminal,
+            responseRejected = responseRejected,
+            stopBackgroundFetch = terminal,
             cause = lastError,
         )
     }
@@ -1036,5 +1122,6 @@ object AiFailoverManager {
         }
     }
 
+    private val SHORT_COOLDOWN_STATUSES = setOf(429, 503)
     private const val MAX_FAILOVER_ATTEMPTS = 32
 }

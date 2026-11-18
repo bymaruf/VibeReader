@@ -1,5 +1,6 @@
 package com.example.vibereader.ui.reader
 
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -27,6 +28,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlin.math.floor
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 /**
  * One screen-sized slice of a chapter's raw text.
@@ -58,6 +60,7 @@ data class EpubPageSlice(
  */
 @Composable
 fun rememberEpubPages(
+    bookId: String,
     chapters: List<BookChapterEntity>,
     viewportWidthDp: Dp,
     viewportHeightDp: Dp,
@@ -94,42 +97,91 @@ fun rememberEpubPages(
     } else {
         rawHeightPx
     }
-    // Bounded height fallback: usable height can never be <= 0.
-    val usableHeightPx = maxOf(300, finiteHeightPx - verticalPaddingPx)
 
     val lineHeightPx = with(density) {
         if (lineHeight.isSp) lineHeight.toPx() else (fontSize.value * 1.6f).sp.toPx()
     }.takeIf { it.isFinite() && it > 0f } ?: 1f
     val titleSpacingPx = with(density) { 12.dp.toPx() }
 
-    var pagesState by remember { mutableStateOf<List<EpubPageSlice>>(emptyList()) }
+    // In landscape the viewport is short enough that a rounding error clips a
+    // whole line. Reserve one line of headroom there so every slice renders
+    // completely; portrait keeps its existing line budget.
+    val isLandscape = safeViewportWidthDp > safeViewportHeightDp
+    val landscapeSafetyPx = if (isLandscape) lineHeightPx else 0f
+    // Bounded height fallback: usable height can never be <= 0.
+    val usableHeightPx = maxOf(
+        300,
+        finiteHeightPx - verticalPaddingPx - landscapeSafetyPx.roundToInt(),
+    )
+
+    // Retain the last valid slices while a new viewport is paginated. Rotation
+    // must never blank the page list (which would leave the reader stuck on
+    // "Preparing pages…"); old slices are replaced atomically when ready.
+    var paginationState by remember(bookId) { mutableStateOf(EpubPaginationResult()) }
     // Serializes pagination runs: rapid settings changes can cancel a LaunchedEffect
     // while a synchronous TextMeasurer pass is still finishing, and TextMeasurer's
     // internal cache is not safe for concurrent use.
-    val paginationMutex = remember { Mutex() }
+    val paginationMutex = remember(bookId) { Mutex() }
 
-    LaunchedEffect(chapters, maxWidthPx, usableHeightPx, fontSize, lineHeight, marginDp) {
-        pagesState = paginationMutex.withLock {
-            withContext(Dispatchers.Default) {
-                paginateChaptersToSlices(
-                    chapters = chapters,
-                    textMeasurer = textMeasurer,
-                    maxWidthPx = maxWidthPx,
-                    maxHeightPx = usableHeightPx,
-                    bodyStyle = TextStyle(fontSize = fontSize, lineHeight = lineHeight),
-                    titleStyle = TextStyle(
-                        fontSize = (fontSize.value * 1.35f).sp,
-                        lineHeight = (lineHeight.value * 1.2f).sp,
-                    ),
-                    lineHeightPx = lineHeightPx,
-                    titleSpacingPx = titleSpacingPx,
-                )
+    val fontSizeSp = fontSize.value.takeIf { it.isFinite() && it > 0f } ?: 18f
+    val lineHeightMultiplier = if (lineHeight.isSp) {
+        (lineHeight.value / fontSizeSp).takeIf { it.isFinite() && it > 0f } ?: 1.6f
+    } else {
+        1.6f
+    }
+
+    val titleStyle = MaterialTheme.typography.titleLarge.copy(
+        fontSize = (fontSize.value * 1.35f).sp,
+        lineHeight = (lineHeight.value * 1.2f).sp,
+    )
+    // Stable primitive keys only: viewport pixels and typography values.
+    // Opening/closing the settings sheet does not change any of these, so it
+    // cannot restart pagination unless a real reading setting changes.
+    LaunchedEffect(
+        bookId,
+        isLandscape,
+        maxWidthPx,
+        usableHeightPx,
+        fontSizeSp,
+        lineHeightMultiplier,
+        marginDp,
+    ) {
+        if (chapters.isEmpty()) return@LaunchedEffect
+        paginationState = paginationState.copy(isPaginating = true)
+        try {
+            val pages = paginationMutex.withLock {
+                withContext(Dispatchers.Default) {
+                    paginateChaptersToSlices(
+                        chapters = chapters,
+                        textMeasurer = textMeasurer,
+                        maxWidthPx = maxWidthPx,
+                        maxHeightPx = usableHeightPx,
+                        bodyStyle = TextStyle(fontSize = fontSize, lineHeight = lineHeight),
+                        // Match the rendered chapter title exactly so the reserved
+                        // first-page height cannot undercount and clip the text.
+                        titleStyle = titleStyle,
+                        lineHeightPx = lineHeightPx,
+                        titleSpacingPx = titleSpacingPx,
+                    )
+                }
+            }
+            paginationState = EpubPaginationResult(pages = pages)
+        } finally {
+            // Rotation cancels this coroutine; clear the flag without discarding
+            // the previous pages so the reader never sticks on a placeholder.
+            if (paginationState.isPaginating) {
+                paginationState = paginationState.copy(isPaginating = false)
             }
         }
     }
 
-    return pagesState
+    return paginationState.pages
 }
+
+private data class EpubPaginationResult(
+    val pages: List<EpubPageSlice> = emptyList(),
+    val isPaginating: Boolean = false,
+)
 
 /**
  * Flattens all chapters into line-bounded screen slices.

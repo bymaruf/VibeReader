@@ -313,7 +313,7 @@ private fun LibraryLoadingSkeleton() {
         val cardHeight = ((safeHeight - rowSpacing * 2) / 3f).coerceAtLeast(140.dp)
 
         LazyVerticalGrid(
-            columns = GridCells.Fixed(2),
+            columns = GridCells.Adaptive(minSize = 155.dp),
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(bottom = 4.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -504,7 +504,7 @@ private fun BookGrid(
         val cardHeight = ((safeHeight - rowSpacing * 2) / 3f).coerceAtLeast(140.dp)
 
         LazyVerticalGrid(
-            columns = GridCells.Fixed(2),
+            columns = GridCells.Adaptive(minSize = 155.dp),
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(bottom = 4.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),

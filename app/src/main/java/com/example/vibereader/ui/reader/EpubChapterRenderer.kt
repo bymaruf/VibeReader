@@ -60,6 +60,8 @@ fun EpubChapterRenderer(
     showTitle: Boolean = true,
     /** Enable vertical scrolling inside the page. Disabled for horizontal viewport pages. */
     scrollEnabled: Boolean = true,
+    /** When false, the pager owns tap-to-toggle so no child consumes the down event. */
+    enableTapGestures: Boolean = true,
 ) {
     val scrollState = rememberScrollState()
     val displayText = pageSlice?.slicedText ?: chapter.text
@@ -71,9 +73,15 @@ fun EpubChapterRenderer(
         modifier = modifier
             .fillMaxSize()
             .background(background)
-            .pointerInput(chapter.bookId, chapterIndex, baseOffset) {
-                detectTapGestures(onTap = { onCanvasTap() })
-            }
+            .then(
+                if (enableTapGestures) {
+                    Modifier.pointerInput(chapter.bookId, chapterIndex, baseOffset) {
+                        detectTapGestures(onTap = { onCanvasTap() })
+                    }
+                } else {
+                    Modifier
+                },
+            )
             .then(if (scrollEnabled) Modifier.verticalScroll(scrollState) else Modifier)
             .padding(horizontal = marginDp.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),

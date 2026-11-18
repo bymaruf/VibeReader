@@ -888,10 +888,10 @@ fun WallpaperStudioSection(
             Spacer(modifier = Modifier.height(16.dp))
 
             GradientActionButton(
-                text = if (isFetchingQuotes) {
-                    "Stop fetching • $fetchedQuoteCount new"
-                } else {
-                    "Fetch AI Quotes · Endless"
+                text = when {
+                    isFetchingQuotes -> "Stop fetching • ${newQuoteCountLabel(fetchedQuoteCount)}"
+                    fetchedQuoteCount > 0 -> "${newQuoteCountLabel(fetchedQuoteCount)} wallpapers created"
+                    else -> "Fetch AI Quotes · Endless"
                 },
                 onClick = if (isFetchingQuotes) onStopFetchingQuotes else onFetchQuotes,
                 enabled = isFetchingQuotes || (!isGenerating && books.isNotEmpty()),
@@ -1386,4 +1386,14 @@ private fun QuoteCard(
             }
         }
     }
+}
+
+/**
+ * Keeps the live fetch counter readable during an endless session:
+ * `5 new`, `12 new`, `20 new`, then `30+ new` once the batch is large.
+ */
+private fun newQuoteCountLabel(count: Int): String = when {
+    count <= 0 -> "0 new"
+    count >= 30 -> "30+ new"
+    else -> "$count new"
 }

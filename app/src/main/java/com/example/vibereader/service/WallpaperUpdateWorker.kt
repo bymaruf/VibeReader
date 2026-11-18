@@ -74,7 +74,10 @@ class WallpaperUpdateWorker(
         )
         val bitmap = TypographyWallpaperGenerator.generateWallpaperBitmap(
             context = applicationContext,
-            quote = wallpaperContent.quote.selectedText.take(MAX_QUOTE_CHARS),
+            // Validate and render the complete approved quote. Truncating it
+            // first used to remove the terminal punctuation, fail validation,
+            // and leave the rotation cursor stuck on the same bad row.
+            quote = wallpaperContent.quote.selectedText,
             bookTitle = wallpaperContent.document.title,
             bookAuthor = wallpaperContent.document.author,
             progressText = wallpaperContent.progressText,
@@ -181,7 +184,6 @@ class WallpaperUpdateWorker(
     companion object {
         const val KEY_MANUAL_REQUEST = "manual_wallpaper_request"
         const val ERROR_KEY = "error"
-        private const val MAX_QUOTE_CHARS = 1_200
         private const val TAG = "WallpaperRotation"
     }
 }

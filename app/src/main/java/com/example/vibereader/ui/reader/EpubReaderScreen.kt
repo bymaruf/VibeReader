@@ -14,7 +14,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -22,6 +26,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.vibereader.data.room.BookChapterEntity
+import kotlin.math.roundToInt
 
 /**
  * EPUB rendering engine (Native Compose).
@@ -50,6 +55,10 @@ fun EpubReaderCanvas(
     onEpubPageChanged: (pageIndex: Int, chapterIndex: Int, totalPages: Int) -> Unit,
     onSelectionChanged: (ReaderSelection?) -> Unit,
     selectionVersion: Int,
+    /** Suppresses transient pagination placeholders while the reader is closing. */
+    isExiting: Boolean = false,
+    /** Progress ratio (0..1) restored into vertical scroll after a mode switch. */
+    restoreVerticalProgress: Float = -1f,
 ) {
     EpubReaderContent(
         chapters = chapters,
@@ -67,6 +76,8 @@ fun EpubReaderCanvas(
         onEpubPageChanged = onEpubPageChanged,
         onSelectionChanged = onSelectionChanged,
         selectionVersion = selectionVersion,
+        isExiting = isExiting,
+        restoreVerticalProgress = restoreVerticalProgress,
     )
 }
 
@@ -87,6 +98,8 @@ private fun EpubReaderContent(
     onEpubPageChanged: (pageIndex: Int, chapterIndex: Int, totalPages: Int) -> Unit,
     onSelectionChanged: (ReaderSelection?) -> Unit,
     selectionVersion: Int,
+    isExiting: Boolean,
+    restoreVerticalProgress: Float,
 ) {
     val fontSize = settings.fontSizeSp.sp
     val lineHeight = (settings.fontSizeSp * settings.lineHeightMultiplier).sp
@@ -110,6 +123,10 @@ private fun EpubReaderContent(
         // the last externally requested one. Skip that one chapter-jump pass and let
         // the page-derived chapter win.
         val skipNextChapterJump = remember { booleanArrayOf(true) }
+        // A viewport-driven repagination restores the reading position by
+        // character offset; skip the "external page index" sync for that pass
+        // so the old numeric page cannot overwrite the anchored slice.
+        val skipNextPageSync = remember { booleanArrayOf(false) }
 
         // A new slice list means the viewport/settings changed. Keep the relative
         // reading position when that happens; on first load use the saved page hint.
@@ -120,20 +137,50 @@ private fun EpubReaderContent(
                 return@LaunchedEffect
             }
             val hadPages = pagingViewModel.totalCalculatedPages > 0
+            val previousAnchor = pagingViewModel.lastAnchor
             val previousProgress = if (hadPages) {
                 pagingViewModel.progress
             } else {
                 (currentEpubPageIndex + 1).toFloat() / pageSlices.size.toFloat()
             }
             pagingViewModel.setCalculatedPages(pageSlices)
-            pagingViewModel.restoreFromProgress(
-                savedProgress = previousProgress,
-                savedPageIndexHint = if (hadPages) -1 else currentEpubPageIndex,
-            )
+            // Rotation/fullscreen rebuilds the slices for the new viewport.
+            // Keep the same chapter/character position instead of relying on
+            // a page fraction that maps to different text at a new page size.
+            val anchoredIndex = previousAnchor?.let { anchor ->
+                pageSlices.indexOfFirst { slice ->
+                    slice.chapterIndex == anchor.chapterIndex &&
+                        anchor.startCharOffset < slice.endCharOffset &&
+                        anchor.endCharOffset > slice.startCharOffset
+                }.takeIf { it >= 0 }
+                    ?: pageSlices.indexOfFirst { it.chapterIndex == anchor.chapterIndex }
+                        .takeIf { it >= 0 }
+            }
+            if (previousAnchor != null && anchoredIndex != null) {
+                skipNextPageSync[0] = true
+                pagingViewModel.restoreFromProgress(
+                    savedProgress = 0f,
+                    savedPageIndexHint = anchoredIndex,
+                )
+            } else {
+                pagingViewModel.restoreFromProgress(
+                    savedProgress = previousProgress,
+                    savedPageIndexHint = currentEpubPageIndex,
+                )
+            }
+            // The index-sync effect for this same composition runs before the
+            // next frame and consumes the flag; clear it afterwards so later
+            // user page changes are never skipped.
+            withFrameNanos { }
+            skipNextPageSync[0] = false
         }
 
         // External page changes (slider, saved position) drive the pager.
         LaunchedEffect(currentEpubPageIndex, pagingViewModel.totalCalculatedPages) {
+            if (skipNextPageSync[0]) {
+                skipNextPageSync[0] = false
+                return@LaunchedEffect
+            }
             if (pagingViewModel.totalCalculatedPages > 0 &&
                 currentEpubPageIndex != pagingViewModel.currentPageIndex
             ) {
@@ -162,11 +209,13 @@ private fun EpubReaderContent(
                     .background(background),
                 contentAlignment = Alignment.Center,
             ) {
-                Text(
-                    text = "Preparing pages…",
-                    color = foreground,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
+                if (!isExiting) {
+                    Text(
+                        text = "Preparing pages…",
+                        color = foreground,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
             }
             return
         }
@@ -192,6 +241,7 @@ private fun EpubReaderContent(
                 )
             },
             modifier = Modifier.fillMaxSize(),
+            onCanvasTap = onCanvasTap,
         ) { pageIndex ->
             val slice = allPages[pageIndex]
             val chapter = chapters.getOrNull(slice.chapterIndex) ?: return@EpubPager
@@ -209,17 +259,34 @@ private fun EpubReaderContent(
                 highlightEndOffset = speechHighlightEnd
                     ?.takeIf { slice.chapterIndex == currentChapterIndex },
                 selection = selection,
-                onCanvasTap = onCanvasTap,
+                onCanvasTap = {},
                 onSelectionChanged = onSelectionChanged,
                 pageSlice = slice,
                 showTitle = slice.isChapterStart,
                 scrollEnabled = false, // horizontal pages never scroll vertically
+                enableTapGestures = false, // tapping is handled by HorizontalPager
             )
         }
         return
     }
 
     val verticalScrollState = rememberScrollState()
+    // Restore the mapped reading position exactly once after a Horizontal ->
+    // Vertical mode switch. The vertical branch is recreated on every switch,
+    // so this never fights later user scrolling.
+    var verticalProgressRestored by remember(chapters) { mutableStateOf(false) }
+    LaunchedEffect(verticalScrollState.maxValue, restoreVerticalProgress) {
+        if (!verticalProgressRestored &&
+            restoreVerticalProgress in 0f..1f &&
+            verticalScrollState.maxValue > 0
+        ) {
+            verticalProgressRestored = true
+            verticalScrollState.scrollTo(
+                (restoreVerticalProgress.coerceIn(0f, 1f) * verticalScrollState.maxValue)
+                    .roundToInt(),
+            )
+        }
+    }
     // Real-time vertical progress: currentScrollPosition / totalScrollRange.
     LaunchedEffect(verticalScrollState.value, verticalScrollState.maxValue) {
         val max = verticalScrollState.maxValue

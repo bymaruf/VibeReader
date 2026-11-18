@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.Canvas
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -29,6 +30,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 
@@ -54,12 +56,65 @@ fun SafeZoomablePdfCanvas(
     ) -> Unit,
     onHighlightTap: (com.example.vibereader.data.room.HighlightEntity) -> Unit,
     onZoomChanged: (Float) -> Unit,
+    zoomEnabled: Boolean = true,
+    zoomResetToken: Int = 0,
 ) {
-    var scale by remember(pageIndex) { mutableFloatStateOf(MIN_SCALE) }
-    var offset by remember(pageIndex) { mutableStateOf(Offset.Zero) }
+    // Page-scoped zoom state. The reset token changes whenever the pager settles
+    // on a different page, so a freshly shown page always starts at 1.0f.
+    var scale by remember(pageIndex, zoomResetToken) { mutableFloatStateOf(MIN_SCALE) }
+    var offset by remember(pageIndex, zoomResetToken) { mutableStateOf(Offset.Zero) }
+    var canvasSize by remember { mutableStateOf(IntSize.Zero) }
 
-    DisposableEffect(pageIndex) {
+    DisposableEffect(pageIndex, zoomResetToken) {
         onDispose { onZoomChanged(MIN_SCALE) }
+    }
+
+    // Re-clamp whenever the scale or the viewport size changes so a zoomed page
+    // can never be dragged into empty whitespace.
+    LaunchedEffect(scale, canvasSize) {
+        if (canvasSize.width > 0 && canvasSize.height > 0) {
+            offset = clampOffset(offset, scale, canvasSize)
+        }
+    }
+
+    val zoomModifier = if (zoomEnabled) {
+        Modifier.pointerInput(pageIndex, zoomResetToken) {
+            awaitEachGesture {
+                awaitFirstDown(requireUnconsumed = false)
+                do {
+                    val event = awaitPointerEvent()
+                    val pressedPointers = event.changes.count { it.pressed }
+                    if (
+                        (pressedPointers > 1 || scale > MIN_SCALE) &&
+                        event.changes.none { it.isConsumed }
+                    ) {
+                        val centroid = event.calculateCentroid(useCurrent = false)
+                        val pan = event.calculatePan()
+                        val zoom = event.calculateZoom()
+                        if (centroid.x.isFinite() && centroid.y.isFinite()) {
+                            val nextScale = (scale * zoom).coerceIn(MIN_SCALE, MAX_SCALE)
+                            val center = Offset(size.width / 2f, size.height / 2f)
+                            val nextOffset = if (nextScale <= MIN_SCALE) {
+                                Offset.Zero
+                            } else {
+                                val anchoredOffset =
+                                    centroid - (centroid - offset - center) * zoom - center
+                                clampOffset(anchoredOffset + pan, nextScale, size)
+                            }
+                            scale = nextScale
+                            offset = nextOffset
+                            onZoomChanged(nextScale)
+                            event.changes.forEach { change ->
+                                if (change.position != change.previousPosition) change.consume()
+                            }
+                        }
+                    }
+                }
+                while (event.changes.any { it.pressed })
+            }
+        }
+    } else {
+        Modifier
     }
 
     Box(
@@ -67,41 +122,8 @@ fun SafeZoomablePdfCanvas(
             if (fitToBounds) Modifier.fillMaxSize() else Modifier.fillMaxWidth().wrapContentHeight(),
         )
             .clipToBounds()
-            .pointerInput(pageIndex) {
-                awaitEachGesture {
-                    awaitFirstDown(requireUnconsumed = false)
-                    do {
-                        val event = awaitPointerEvent()
-                        val pressedPointers = event.changes.count { it.pressed }
-                        if (
-                            (pressedPointers > 1 || scale > MIN_SCALE) &&
-                            event.changes.none { it.isConsumed }
-                        ) {
-                            val centroid = event.calculateCentroid(useCurrent = false)
-                            val pan = event.calculatePan()
-                            val zoom = event.calculateZoom()
-                            if (centroid.x.isFinite() && centroid.y.isFinite()) {
-                                val nextScale = (scale * zoom).coerceIn(MIN_SCALE, MAX_SCALE)
-                                val center = Offset(size.width / 2f, size.height / 2f)
-                                val nextOffset = if (nextScale <= MIN_SCALE) {
-                                    Offset.Zero
-                                } else {
-                                    val anchoredOffset =
-                                        centroid - (centroid - offset - center) * zoom - center
-                                    clampOffset(anchoredOffset + pan, nextScale, size)
-                                }
-                                scale = nextScale
-                                offset = nextOffset
-                                onZoomChanged(nextScale)
-                                event.changes.forEach { change ->
-                                    if (change.position != change.previousPosition) change.consume()
-                                }
-                            }
-                        }
-                    }
-                    while (event.changes.any { it.pressed })
-                }
-            }
+            .onSizeChanged { canvasSize = it }
+            .then(zoomModifier)
     ) {
         Box(
             modifier = if (fitToBounds) Modifier.fillMaxSize() else {
@@ -167,10 +189,12 @@ fun SafeZoomablePdfCanvas(
             savedHighlights = savedHighlights,
             onCanvasTap = onCanvasTap,
             onDoubleTap = {
-                val nextScale = if (scale > MIN_SCALE) MIN_SCALE else DOUBLE_TAP_SCALE
-                scale = nextScale
-                offset = Offset.Zero
-                onZoomChanged(nextScale)
+                if (zoomEnabled) {
+                    val nextScale = if (scale > MIN_SCALE) MIN_SCALE else DOUBLE_TAP_SCALE
+                    scale = nextScale
+                    offset = Offset.Zero
+                    onZoomChanged(nextScale)
+                }
             },
             onTextLongPress = onTextLongPress,
             onSelectionHandleDrag = onSelectionHandleDrag,
@@ -208,4 +232,4 @@ private fun clampOffset(offset: Offset, scale: Float, size: IntSize): Offset {
 
 private const val MIN_SCALE = 1f
 private const val MAX_SCALE = 4f
-private const val DOUBLE_TAP_SCALE = 2.5f
+private const val DOUBLE_TAP_SCALE = 2.2f

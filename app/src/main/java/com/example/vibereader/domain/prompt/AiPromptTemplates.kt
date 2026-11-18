@@ -32,9 +32,12 @@ object AiPromptTemplates {
         bookTitle: String,
         author: String?,
         count: Int,
+        excludedQuotes: List<String> = emptyList(),
     ): String = """
-        Give ${count.coerceIn(1, 5)} famous, accurate quotes from "$bookTitle"${authorSuffix(author)} as a JSON array of strings.
-        If unknown, reply $UNKNOWN_BOOK.
+        Give ${count.coerceIn(8, 12)} distinct, accurate, memorable quotes from "$bookTitle"${authorSuffix(author)}.
+        Each must be 40-240 characters and a complete, self-contained sentence.
+        Return only a JSON array: [{"quote":"exact wording","author":"${author?.trim().orEmpty()}"}]
+        If unknown, reply $UNKNOWN_BOOK.${exclusionBlock(excludedQuotes)}
     """.trimIndent()
 
     fun buildHumanSummaryPrompt(text: String): String {
@@ -107,9 +110,12 @@ object AiPromptTemplates {
     }
 
     fun buildQuoteSystemPrompt(): String = """
-        You are a literary quote curator.
-        Return only a JSON array of strings. Each string must be a complete, meaningful quote copied faithfully from the book.
-        Do not add commentary, markdown fences, numbering, or invented text.
+        You are a literary quote curator. Work silently; never reveal reasoning.
+        Return only a clean JSON array of objects:
+        [{"quote":"complete, meaningful quote copied faithfully from the book","author":"author name"}]
+        Return 8 to 12 distinct quotes. Each must be verbatim, insightful, 40-240
+        characters, and a complete sentence suitable for a lock screen.
+        Do not add commentary, thinking traces, markdown fences, numbering, or invented text.
     """.trimIndent()
 
     /**
@@ -124,9 +130,9 @@ object AiPromptTemplates {
         excludedQuotes: List<String> = emptyList(),
     ): String = """
         Book: "$bookTitle"${authorSuffix(author)}
-        Using only your built-in knowledge of this published book, return up to $count new quotes.
+        Using only your built-in knowledge of this published book, return ${count.coerceIn(8, 12)} distinct new quotes.
         If you do not recognize the book or cannot recall its exact text, reply exactly: $UNKNOWN_BOOK
-        Return only a JSON array of strings.${exclusionBlock(excludedQuotes)}
+        Return clean JSON: [{"quote":"exact wording","author":"author name"}].${exclusionBlock(excludedQuotes)}
     """.trimIndent()
 
     fun buildQuoteRagRequest(
@@ -137,9 +143,10 @@ object AiPromptTemplates {
         excludedQuotes: List<String> = emptyList(),
     ): String = """
         Book: "$bookTitle"${authorSuffix(author)}
-        Return up to $count complete, meaningful quotes from the passages below.
-        Copy the exact wording; do not paraphrase or invent text.
-        Return only a JSON array of strings.${exclusionBlock(excludedQuotes)}
+        Return ${count.coerceIn(8, 12)} distinct, complete, insightful quotes from the passages below.
+        Copy the exact wording; do not paraphrase or invent text. Each quote must be
+        a complete sentence of 40-240 characters suitable for a lock screen.
+        Return only a clean JSON array: [{"quote":"exact wording","author":"author name"}].${exclusionBlock(excludedQuotes)}
         Passages:
         ${AiContextSanitizer.sanitize(passages)}
     """.trimIndent()
@@ -156,9 +163,10 @@ object AiPromptTemplates {
         excludedQuotes: List<String> = emptyList(),
     ): String = """
         Book: "$bookTitle"${authorSuffix(author)}
-        Return up to $count complete quotes you are confident actually appear in this book.
+        Return ${count.coerceIn(8, 12)} distinct, complete quotes you are confident actually appear in this book.
+        Copy exact wording; never invent or paraphrase.
         If you cannot recall exact wording, return [].
-        Return only a JSON array of strings.${exclusionBlock(excludedQuotes)}
+        Return clean JSON: [{"quote":"exact wording","author":"author name"}].${exclusionBlock(excludedQuotes)}
     """.trimIndent()
 
     /**
@@ -194,7 +202,8 @@ object AiPromptTemplates {
             .map { "- ${it.take(MAX_EXCLUSION_LINE_CHARS)}" }
             .joinToString("\n")
         if (lines.isBlank()) return ""
-        return "\nDo not repeat these already collected quotes:\n$lines"
+        return "\nDo NOT repeat any of these existing quotes " +
+            "(Do not repeat these already collected quotes):\n$lines"
     }
 
     private const val MAX_ANSWER_WORDS = 120

@@ -4,6 +4,7 @@ import androidx.room.withTransaction
 import com.example.vibereader.core.database.VibeReaderDatabase
 import com.example.vibereader.data.room.QuoteEntity
 import com.example.vibereader.data.room.QuoteSource
+import com.example.vibereader.domain.QuoteQualityValidator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -95,7 +96,12 @@ class QuoteRepository(
      */
     suspend fun getNextApprovedQuote(lastQuoteId: Long): QuoteEntity? =
         withContext(Dispatchers.IO) {
-            val approved = quoteDao.observeApproved().first()
+            val approved = quoteDao.observeApproved()
+                .first()
+                // Legacy rows may predate the renderer's completeness rules.
+                // Skipping them here keeps automatic rotation from repeatedly
+                // failing on the same unrenderable quote.
+                .filter { QuoteQualityValidator.isValidQuote(it.selectedText) }
             if (approved.isEmpty()) return@withContext null
             val ordered = approved.sortedWith(
                 compareBy<QuoteEntity> { it.createdAt }.thenBy { it.id },

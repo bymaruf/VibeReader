@@ -10,6 +10,7 @@ import android.os.Build
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -66,6 +67,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpSize
@@ -129,8 +133,10 @@ private fun ReadingTheme.resolve(isSystemDark: Boolean): ResolvedReadingTheme = 
 private class PdfDisplayBitmapMap(
     private val persistedBitmaps: Map<Int, Bitmap>,
     private val engine: PdfDocumentEngine,
+    private val includeEngineCache: Boolean,
 ) : Map<Int, Bitmap> by persistedBitmaps {
     override fun get(key: Int): Bitmap? {
+        if (!includeEngineCache) return persistedBitmaps[key]
         val cached = engine.getCachedPage(key)
         val persisted = persistedBitmaps[key]
         return when {
@@ -186,9 +192,20 @@ fun ReaderScreen(
     var settingsVisible by rememberSaveable { mutableStateOf(false) }
     var assistantVisible by rememberSaveable { mutableStateOf(false) }
     var chromeVisible by rememberSaveable { mutableStateOf(true) }
+    // Root Scaffold size is independent of chrome visibility. Pagination uses
+    // this minus the measured bar heights, so showing/hiding controls never
+    // changes the page grid.
+    var readerRootSizePx by remember { mutableStateOf(IntSize.Zero) }
+    var readerTopBarHeightPx by remember { mutableStateOf(0) }
+    var readerBottomBarHeightPx by remember { mutableStateOf(0) }
     var pdfJumpRequest by remember(bookId) { mutableIntStateOf(-1) }
     var currentEpubChapter by remember(bookId) { mutableIntStateOf(0) }
     var currentEpubPageIndex by remember(bookId) { mutableIntStateOf(0) }
+    var isExitingReader by remember(bookId) { mutableStateOf(false) }
+    BackHandler {
+        isExitingReader = true
+        onBack()
+    }
     var speechTarget by remember(bookId) { mutableStateOf<SpeechTarget?>(null) }
     var epubSelectionVersion by remember(bookId) { mutableIntStateOf(0) }
 
@@ -357,11 +374,34 @@ fun ReaderScreen(
         }
     }
 
-    val title = state.book?.displayTitle().orEmpty().ifBlank { "Reader" }
+    val title = state.book?.displayTitle().orEmpty()
     val isPdf = state.book?.format.equals("PDF", ignoreCase = true)
     val isHorizontalEpub = !isPdf && state.settings.scrollMode == ScrollMode.HORIZONTAL
-    var epubTotalPages by remember(bookId, isHorizontalEpub) { mutableIntStateOf(0) }
-    var epubVerticalProgress by remember(bookId, isHorizontalEpub) { mutableStateOf(0f) }
+    var epubTotalPages by remember(bookId) { mutableIntStateOf(0) }
+    var epubVerticalProgress by remember(bookId) { mutableStateOf(0f) }
+    // Mode switches map the destination position from the source ratio instead
+    // of resetting to the cover; -1 means "no pending restore".
+    var pendingHorizontalRestore by remember(bookId) { mutableStateOf(-1f) }
+    var pendingVerticalRestore by remember(bookId) { mutableStateOf(-1f) }
+    var lastEpubHorizontalMode by remember(bookId) { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(isHorizontalEpub, isPdf, state.book?.id) {
+        if (isPdf) return@LaunchedEffect
+        val previousMode = lastEpubHorizontalMode
+        lastEpubHorizontalMode = isHorizontalEpub
+        if (previousMode == null || previousMode == isHorizontalEpub) return@LaunchedEffect
+        if (isHorizontalEpub) {
+            // Vertical -> Horizontal: apply the last vertical ratio once the
+            // new slice list is available.
+            pendingHorizontalRestore = epubVerticalProgress.coerceIn(0f, 1f)
+        } else {
+            // Horizontal -> Vertical: map the page ratio onto scroll progress.
+            pendingVerticalRestore = if (epubTotalPages > 0) {
+                currentEpubPageIndex.toFloat() / epubTotalPages.toFloat()
+            } else {
+                0f
+            }.coerceIn(0f, 1f)
+        }
+    }
     val currentPageLabel = when {
         isPdf -> "${state.pdfPageIndex + 1} / ${state.pdfPageCount.coerceAtLeast(1)}"
         isHorizontalEpub && epubTotalPages > 0 ->
@@ -382,14 +422,25 @@ fun ReaderScreen(
     // synchronous LRU cache. getCachedPage() is read during composition, so a
     // prefetched neighbour paints on the first frame instead of flashing a
     // spinner. pdfCacheVersion invalidates this map when a silent prefetch lands.
-    val pdfPageBitmaps = remember(state.pdfPageBitmaps, pdfCacheVersion, pdfEngine) {
-        PdfDisplayBitmapMap(state.pdfPageBitmaps, pdfEngine)
+    val cropPdfWhitespace = isPdf && state.settings.cropPdfWhitespace
+    val pdfPageBitmaps = remember(
+        state.pdfPageBitmaps,
+        pdfCacheVersion,
+        pdfEngine,
+        cropPdfWhitespace,
+    ) {
+        PdfDisplayBitmapMap(
+            persistedBitmaps = state.pdfPageBitmaps,
+            engine = pdfEngine,
+            includeEngineCache = !cropPdfWhitespace,
+        )
     }
 
     Scaffold(
         modifier = Modifier
             .fillMaxSize()
-            .background(readerBackground),
+            .background(readerBackground)
+            .onSizeChanged { readerRootSizePx = it },
         containerColor = readerBackground,
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
@@ -402,7 +453,11 @@ fun ReaderScreen(
                     title = title,
                     foreground = readerForeground,
                     background = readerBackground.copy(alpha = 0.97f),
-                    onBack = onBack,
+                    modifier = Modifier.onSizeChanged { readerTopBarHeightPx = it.height },
+                    onBack = {
+                        isExitingReader = true
+                        onBack()
+                    },
                     onSettings = { settingsVisible = true },
                     onAssistant = { assistantVisible = true },
                 )
@@ -428,6 +483,7 @@ fun ReaderScreen(
                     currentChapter = currentEpubChapter,
                     foreground = readerForeground,
                     background = readerBackground.copy(alpha = 0.97f),
+                    modifier = Modifier.onSizeChanged { readerBottomBarHeightPx = it.height },
                     onPdfPageChange = { page ->
                         pdfJumpRequest = page
                         viewModel.setPdfPageIndex(page)
@@ -478,6 +534,7 @@ fun ReaderScreen(
                         aiProcessingPageIndex = state.aiProcessingPageIndex,
                         title = title,
                         theme = state.settings.readingTheme,
+                        cropPdfWhitespace = cropPdfWhitespace,
                         selection = state.selection,
                         speechSelection = state.speechHighlight,
                         modifier = Modifier
@@ -497,7 +554,7 @@ fun ReaderScreen(
                             // the ViewModel's high-resolution render is the
                             // authority; base-resolution neighbours are only
                             // prefetched at fit scale.
-                            if (zoomScale <= 1.01f) {
+                            if (zoomScale <= 1.01f && !cropPdfWhitespace) {
                                 pdfFile?.let { file ->
                                     pdfEngine.prefetchAround(
                                         file = file,
@@ -517,11 +574,27 @@ fun ReaderScreen(
 
                 else -> {
                     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                        // Lock the pagination viewport to the reader area minus
+                        // the measured (constant) bar heights. Chrome visibility
+                        // must never change the page grid.
+                        val density = LocalDensity.current
+                        val rootWidthPx = readerRootSizePx.width.takeIf { it > 0 }
+                            ?: with(density) { maxWidth.toPx().roundToInt() }
+                        val rootHeightPx = readerRootSizePx.height.takeIf { it > 0 }
+                            ?: with(density) { maxHeight.toPx().roundToInt() }
+                        val fallbackTopBarPx = with(density) { 64.dp.toPx().roundToInt() }
+                        val fallbackBottomBarPx = with(density) { 56.dp.toPx().roundToInt() }
+                        val fixedChromePx =
+                            (readerTopBarHeightPx.takeIf { it > 0 } ?: fallbackTopBarPx) +
+                                (readerBottomBarHeightPx.takeIf { it > 0 } ?: fallbackBottomBarPx)
+                        val pageWidthPx = rootWidthPx.coerceAtLeast(1)
+                        val pageHeightPx = (rootHeightPx - fixedChromePx).coerceAtLeast(1)
                         val epubPages = if (isHorizontalEpub) {
                             rememberEpubPages(
+                                bookId = bookId,
                                 chapters = state.chapters,
-                                viewportWidthDp = maxWidth,
-                                viewportHeightDp = maxHeight,
+                                viewportWidthDp = with(density) { pageWidthPx.toDp() },
+                                viewportHeightDp = with(density) { pageHeightPx.toDp() },
                                 fontSize = state.settings.fontSizeSp.sp,
                                 lineHeight = (state.settings.fontSizeSp * state.settings.lineHeightMultiplier).sp,
                                 marginDp = state.settings.marginDp,
@@ -529,17 +602,38 @@ fun ReaderScreen(
                         } else {
                             emptyList()
                         }
-                        LaunchedEffect(epubPages.size) {
-                            epubTotalPages = epubPages.size
+                        LaunchedEffect(epubPages) {
                             if (epubPages.isNotEmpty()) {
-                                val restored = state.initialEpubScrollOffset.coerceIn(0, epubPages.lastIndex)
-                                // Prefer restoring by saved page index; fall back to saved chapter.
-                                val target = if (state.initialEpubScrollOffset >= 0) restored else {
-                                    epubPages.indexOfFirst { it.chapterIndex == state.initialEpubChapter }
-                                        .takeIf { it >= 0 } ?: 0
+                                // Keep the last horizontal page count alive while
+                                // vertical mode runs so switching back can map it.
+                                val previousTotal = epubTotalPages
+                                val previousIndex = currentEpubPageIndex
+                                epubTotalPages = epubPages.size
+                                val ratioRestore = pendingHorizontalRestore
+                                if (ratioRestore >= 0f) {
+                                    pendingHorizontalRestore = -1f
+                                    currentEpubPageIndex =
+                                        (ratioRestore * (epubPages.size - 1))
+                                            .roundToInt()
+                                            .coerceIn(0, epubPages.lastIndex)
+                                } else if (previousTotal > 0 && previousTotal != epubPages.size) {
+                                    // Rotation changed the page grid: map the
+                                    // exact progress ratio onto the new count.
+                                    val ratio = previousIndex.toFloat() / previousTotal.toFloat()
+                                    currentEpubPageIndex =
+                                        (ratio * (epubPages.size - 1))
+                                            .roundToInt()
+                                            .coerceIn(0, epubPages.lastIndex)
+                                } else {
+                                    val restored = state.initialEpubScrollOffset.coerceIn(0, epubPages.lastIndex)
+                                    // Prefer restoring by saved page index; fall back to saved chapter.
+                                    val target = if (state.initialEpubScrollOffset >= 0) restored else {
+                                        epubPages.indexOfFirst { it.chapterIndex == state.initialEpubChapter }
+                                            .takeIf { it >= 0 } ?: 0
+                                    }
+                                    if (currentEpubPageIndex > epubPages.lastIndex) currentEpubPageIndex = epubPages.lastIndex
+                                    if (currentEpubPageIndex == 0 && target > 0) currentEpubPageIndex = target
                                 }
-                                if (currentEpubPageIndex > epubPages.lastIndex) currentEpubPageIndex = epubPages.lastIndex
-                                if (currentEpubPageIndex == 0 && target > 0) currentEpubPageIndex = target
                             }
                         }
                         EpubReaderCanvas(
@@ -594,6 +688,8 @@ fun ReaderScreen(
                             },
                             onSelectionChanged = viewModel::setSelection,
                             selectionVersion = epubSelectionVersion,
+                            isExiting = isExitingReader,
+                            restoreVerticalProgress = pendingVerticalRestore,
                         )
                     }
                 }
@@ -641,7 +737,16 @@ fun ReaderScreen(
                 edgeTtsPlayer.stop()
                 ttsManager.stop()
             },
-            onSettingsChange = viewModel::updateSettings,
+            onSettingsChange = { updated ->
+                val cropChanged =
+                    state.settings.cropPdfWhitespace != updated.cropPdfWhitespace
+                viewModel.updateSettings(updated)
+                if (cropChanged) {
+                    // Engine prefetches are never cropped; drop them so the
+                    // pager cannot paint a stale untrimmed page after toggling.
+                    pdfEngine.clearPageCache()
+                }
+            },
             onScrollModeChange = viewModel::setScrollMode,
             onDismiss = { settingsVisible = false },
         )
@@ -724,11 +829,13 @@ private fun ReaderTopBar(
     title: String,
     foreground: Color,
     background: Color,
+    modifier: Modifier = Modifier,
     onBack: () -> Unit,
     onSettings: () -> Unit,
     onAssistant: () -> Unit,
 ) {
     TopAppBar(
+        modifier = modifier,
         title = {
             Text(
                 title,
@@ -779,6 +886,7 @@ private fun ReaderBottomBar(
     onEpubPageChange: (Int) -> Unit,
     onVerticalProgressChange: (Float) -> Unit,
     onChapterChange: (Int) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     val inactiveTrackColor = foreground.copy(alpha = 0.12f)
@@ -817,7 +925,7 @@ private fun ReaderBottomBar(
     }
 
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .background(background)
             .padding(horizontal = 24.dp, vertical = 3.dp),

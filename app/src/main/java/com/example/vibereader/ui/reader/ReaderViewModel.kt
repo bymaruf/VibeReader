@@ -32,8 +32,10 @@ import com.example.vibereader.data.room.QuoteEntity
 import com.example.vibereader.data.room.QuoteSource
 import com.example.vibereader.data.room.ReadingProgressEntity
 import com.example.vibereader.data.room.ReaderPreferenceEntity
+import com.example.vibereader.domain.QuoteQualityValidator
 import com.example.vibereader.domain.model.EBookFormat
 import com.example.vibereader.domain.prompt.AiContextSanitizer
+import com.example.vibereader.domain.prompt.AiResponseSanitizer
 import com.example.vibereader.model.ReadingTheme
 import com.example.vibereader.util.PdfPageCache
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
@@ -55,11 +57,14 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
+import java.util.Locale
 import kotlin.coroutines.coroutineContext
 import kotlin.math.roundToInt
 
@@ -74,6 +79,7 @@ data class ReaderSettings(
     val lineHeightMultiplier: Float = 1.6f,
     val marginDp: Float = 24f,
     val scrollMode: ScrollMode = ScrollMode.HORIZONTAL,
+    val cropPdfWhitespace: Boolean = false,
 )
 
 data class ReaderSelection(
@@ -94,6 +100,8 @@ data class AiTaskResult(
     val content: String,
     /** True when the card represents a setup, network, or provider failure. */
     val isError: Boolean = false,
+    /** Re-runs the exact failed action without the user re-selecting text. */
+    val retry: (() -> Unit)? = null,
 )
 
 data class ReaderUiState(
@@ -137,9 +145,13 @@ class ReaderViewModel(
     // crash the reader before the user even presses an AI button).
     private val askAiEngine by lazy { AskAiEngine(appContext, responseCache = aiResponseCache) }
     private val aiResponseCache by lazy { AiResponseCache(database) }
+    private val readerPreferences by lazy {
+        appContext.getSharedPreferences(READER_PREFERENCES_NAME, Context.MODE_PRIVATE)
+    }
     private val stateLock = Any()
     private val renderingPages = mutableSetOf<String>()
-    private val renderedPdfPages = mutableSetOf<String>()
+    /** Serializes native page open/render/close for this ViewModel's renderer. */
+    private val pdfRenderMutex = Mutex()
     private val _uiState = MutableStateFlow(ReaderUiState())
     val uiState: StateFlow<ReaderUiState> = _uiState.asStateFlow()
 
@@ -251,6 +263,9 @@ class ReaderViewModel(
                             ScrollMode.entries.firstOrNull { it.name == storedMode }
                         }
                 } ?: ScrollMode.HORIZONTAL
+                val savedCropPdfWhitespace = withContext(Dispatchers.IO) {
+                    readerPreferences.getBoolean(KEY_CROP_PDF_WHITESPACE, false)
+                }
                 val savedReadingTheme = withContext(Dispatchers.IO) {
                     database.bookReadingThemeDao()
                         .getForBook(bookId)
@@ -274,6 +289,7 @@ class ReaderViewModel(
                         settings = ReaderSettings(
                             scrollMode = savedScrollMode,
                             readingTheme = savedReadingTheme,
+                            cropPdfWhitespace = savedCropPdfWhitespace,
                         ),
                     )
                     setPdfPageIndex(page)
@@ -288,6 +304,7 @@ class ReaderViewModel(
                         settings = ReaderSettings(
                             scrollMode = savedScrollMode,
                             readingTheme = savedReadingTheme,
+                            cropPdfWhitespace = savedCropPdfWhitespace,
                         ),
                         initialEpubChapter = savedChapter,
                         initialEpubScrollOffset = savedLocation?.groupValues?.get(2)?.toIntOrNull() ?: 0,
@@ -307,7 +324,33 @@ class ReaderViewModel(
 
     fun updateSettings(settings: ReaderSettings) {
         val state = _uiState.value
-        _uiState.value = state.copy(settings = settings)
+        val cropChanged = state.settings.cropPdfWhitespace != settings.cropPdfWhitespace
+        _uiState.value = if (cropChanged) {
+            // Drop every rendered bitmap so the toggle immediately reflects in
+            // the pager; the render key also changes with the crop flag.
+            state.copy(
+                settings = settings,
+                pdfPageBitmap = null,
+                pdfPageBitmaps = emptyMap(),
+            )
+        } else {
+            state.copy(settings = settings)
+        }
+        if (cropChanged) {
+            guardedLaunch {
+                try {
+                    withContext(Dispatchers.IO) {
+                        readerPreferences.edit()
+                            .putBoolean(KEY_CROP_PDF_WHITESPACE, settings.cropPdfWhitespace)
+                            .apply()
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    showMessage(error.localizedMessage ?: "Could not save the crop setting.")
+                }
+            }
+        }
         val bookId = state.book?.id ?: return
         if (state.settings.readingTheme == settings.readingTheme) return
         guardedLaunch {
@@ -757,11 +800,20 @@ class ReaderViewModel(
             if (cachedBitmap.width >= requiredWidth * 0.97f) return
         }
         val bookFile = File(book.filePath)
+        val cropWhitespace = state.settings.cropPdfWhitespace
+        // Width is part of the cache identity so a landscape render can never
+        // reuse a narrow portrait bitmap. The bucket keeps the key stable
+        // across small inset changes while rotation still produces a new key.
+        // The crop flag also separates trimmed and untrimmed renders.
+        val widthBucket = (targetWidth / PDF_CACHE_WIDTH_BUCKET_PX).coerceAtLeast(1)
         val cacheBookKey =
-            "${book.id}:${bookFile.absolutePath}:${bookFile.length()}:${bookFile.lastModified()}:$targetHeight"
+            "${book.id}:${bookFile.absolutePath}:${bookFile.length()}:${bookFile.lastModified()}:$targetHeight:$widthBucket:crop=$cropWhitespace"
         val renderKey = "$cacheBookKey:$page:$targetWidth"
         synchronized(stateLock) {
-            if (renderKey in renderedPdfPages) return
+            // A previous request may still be in flight. The per-page UI
+            // retries after a short delay, and the job always removes this key
+            // in `finally`, so a cancelled/failed render can never wedge the
+            // page on a permanent spinner.
             if (!renderingPages.add(renderKey)) return
         }
 
@@ -772,14 +824,16 @@ class ReaderViewModel(
                     PdfPageCache.get(appContext, cacheBookKey, page, targetWidth)?.let { cached ->
                         return@withContext cached
                     }
-                    val renderedBitmap = synchronized(stateLock) {
-                        if (pdfRendererBookId != book.id) {
-                            throw IOException("PDF renderer is not open for this book.")
+                    val renderedBitmap = pdfRenderMutex.withLock {
+                        val renderer = synchronized(stateLock) {
+                            if (pdfRendererBookId != book.id) {
+                                throw IOException("PDF renderer is not open for this book.")
+                            }
+                            pdfRenderer ?: throw IOException("PDF renderer is closed.")
                         }
-                        val renderer = pdfRenderer ?: throw IOException("PDF renderer is closed.")
                         val pdfPage = renderer.openPage(page)
                         try {
-                            renderPageCrisp(
+                            val rendered = renderPageCrisp(
                                 page = pdfPage,
                                 targetWidth = targetWidth,
                                 targetHeight = targetHeight,
@@ -787,6 +841,14 @@ class ReaderViewModel(
                                 maxBitmapPixels = maxPdfBitmapPixels(),
                                 maxBitmapDimension = MAX_PDF_BITMAP_DIMENSION,
                             ) ?: throw IOException("Not enough memory to render this PDF page.")
+                            if (cropWhitespace) {
+                                // Cropping is best-effort: a failed bounds scan
+                                // returns the original rendered bitmap instead
+                                // of null, so the page still paints.
+                                cropPdfWhitespaceMargins(rendered)
+                            } else {
+                                rendered
+                            }
                         } finally {
                             pdfPage.close()
                         }
@@ -795,11 +857,11 @@ class ReaderViewModel(
                     PdfPageCache.putMemory(cacheBookKey, page, renderedBitmap)
                     renderedBitmap
                 }
-                synchronized(stateLock) {
-                    renderedPdfPages.add(renderKey)
-                }
                 val current = _uiState.value
-                if (current.book?.id == book.id) {
+                if (
+                    current.book?.id == book.id &&
+                    current.settings.cropPdfWhitespace == cropWhitespace
+                ) {
                     val preferredBitmap = listOfNotNull(
                         current.pdfPageBitmaps[page],
                         bitmap,
@@ -1009,7 +1071,12 @@ class ReaderViewModel(
                 }
             } catch (timeout: TimeoutCancellationException) {
                 Log.e(AI_ERROR_TAG, "Execution error", timeout)
-                showAiError(book, "Ask Book AI failed", AI_TIMEOUT_MESSAGE)
+                showAiError(
+                    book = book,
+                    title = "Ask Book AI failed",
+                    message = AI_TIMEOUT_MESSAGE,
+                    retry = { askBookAi(trimmedQuestion) },
+                )
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
@@ -1018,6 +1085,7 @@ class ReaderViewModel(
                     book = book,
                     title = "Ask Book AI failed",
                     message = error.toAiUiMessage("Could not answer this question."),
+                    retry = { askBookAi(trimmedQuestion) },
                 )
             } finally {
                 setWorking(false)
@@ -1030,7 +1098,12 @@ class ReaderViewModel(
      * transient Snackbar for parity with other reader actions, and force-emits a
      * Toast so the user never sees a silent AI failure.
      */
-    private fun showAiError(book: BookEntity, title: String, message: String) {
+    private fun showAiError(
+        book: BookEntity,
+        title: String,
+        message: String,
+        retry: (() -> Unit)? = null,
+    ) {
         val clean = message.trim().ifBlank { AiFailoverManager.ALL_KEYS_FAILED_MESSAGE }
         Log.e(AI_ERROR_TAG, "Execution error: $title - $clean")
         if (_uiState.value.book?.id != book.id) return
@@ -1039,6 +1112,7 @@ class ReaderViewModel(
                 title = title,
                 content = clean,
                 isError = true,
+                retry = retry,
             ),
         )
         showMessage(clean)
@@ -1083,12 +1157,27 @@ class ReaderViewModel(
             state.pdfPageText
                 .takeIf(String::isNotBlank)
                 ?.let { return AskAiContext(it.take(MAX_ASK_CONTEXT_CHARS), isExcerpt = true) }
-            return AskAiContext(
-                text = runCatching {
-                    extractPdfPageText(book, state.pdfPageIndex)
-                }.getOrDefault("").take(MAX_ASK_CONTEXT_CHARS),
-                isExcerpt = true,
-            )
+
+            // Scanned/cover pages can have no selectable layer. Walk the
+            // current page and its nearest neighbours before giving up so Ask
+            // AI still receives real context from large PDFs.
+            val currentPage = state.pdfPageIndex.coerceAtLeast(0)
+            val pageOffsets = listOf(0, 1, -1, 2, -2)
+            for (offset in pageOffsets) {
+                val page = currentPage + offset
+                if (page < 0) continue
+                if (state.pdfPageCount > 0 && page >= state.pdfPageCount) continue
+                val text = runCatching { extractPdfPageText(book, page) }
+                    .getOrDefault("")
+                    .trim()
+                if (text.isNotBlank()) {
+                    return AskAiContext(
+                        text = text.take(MAX_ASK_CONTEXT_CHARS),
+                        isExcerpt = true,
+                    )
+                }
+            }
+            return AskAiContext("", isExcerpt = true)
         }
 
         val chapters = state.chapters
@@ -1165,7 +1254,12 @@ class ReaderViewModel(
                 }
             } catch (timeout: TimeoutCancellationException) {
                 Log.e(AI_ERROR_TAG, "Execution error", timeout)
-                showAiError(book, "Summary failed", AI_TIMEOUT_MESSAGE)
+                showAiError(
+                    book = book,
+                    title = "Summary failed",
+                    message = AI_TIMEOUT_MESSAGE,
+                    retry = { summarizeEntireBook(book) },
+                )
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
@@ -1174,6 +1268,7 @@ class ReaderViewModel(
                     book = book,
                     title = "Summary failed",
                     message = error.toAiUiMessage("Could not summarize this book."),
+                    retry = { summarizeEntireBook(book) },
                 )
             } finally {
                 setWorking(false)
@@ -1436,20 +1531,41 @@ class ReaderViewModel(
                 }
                 if (_uiState.value.book?.id == book.id) {
                     if (task == AiTask.EXTRACT_QUOTE && selection != null) {
-                        val (header, quote) = parseQuote(response)
-                        database.quoteDao().upsert(
-                            QuoteEntity(
-                                bookId = book.id,
-                                selectedText = sanitizeStoredText("$header\n\n$quote"),
-                                chapter = chapterTitle.take(MAX_META_TEXT_CHARS),
-                                chapterIndex = selection.chapterIndex.coerceAtLeast(0),
-                                characterOffset = selection.startOffset.coerceAtLeast(0),
-                                endCharacterOffset = selection.endOffset.coerceAtLeast(0),
-                                source = QuoteSource.AI,
-                            ),
-                        )
+                        val (header, quote) = runCatching { parseQuote(response) }
+                            .getOrElse {
+                                // Keep quote extraction useful even when a free
+                                // model ignores the JSON contract. The selected
+                                // passage is already faithful book text.
+                                val fallback = AiContextSanitizer.truncateAtBoundary(
+                                    AiContextSanitizer.sanitize(selection.text),
+                                    MAX_READER_QUOTE_CHARS,
+                                ).trim()
+                                if (fallback.isBlank()) throw it
+                                "QUOTE" to fallback
+                            }
+                        val storedText = sanitizeStoredText("$header\n\n$quote")
+                        val duplicate = database.quoteDao()
+                            .getForBook(book.id)
+                            .any {
+                                it.selectedText.trim().equals(storedText.trim(), ignoreCase = true)
+                            }
+                        if (duplicate) {
+                            showMessage("That AI quote is already in your library.")
+                        } else {
+                            database.quoteDao().upsert(
+                                QuoteEntity(
+                                    bookId = book.id,
+                                    selectedText = storedText,
+                                    chapter = chapterTitle.take(MAX_META_TEXT_CHARS),
+                                    chapterIndex = selection.chapterIndex.coerceAtLeast(0),
+                                    characterOffset = selection.startOffset.coerceAtLeast(0),
+                                    endCharacterOffset = selection.endOffset.coerceAtLeast(0),
+                                    source = QuoteSource.AI,
+                                ),
+                            )
+                            showMessage("AI quote saved.")
+                        }
                         clearSelection()
-                        showMessage("AI quote saved.")
                     } else {
                         _uiState.value = _uiState.value.copy(
                             aiResult = AiTaskResult(
@@ -1461,7 +1577,21 @@ class ReaderViewModel(
                 }
             } catch (timeout: TimeoutCancellationException) {
                 Log.e(AI_ERROR_TAG, "Execution error", timeout)
-                showAiError(book, "${task.title} failed", AI_TIMEOUT_MESSAGE)
+                showAiError(
+                    book = book,
+                    title = "${task.title} failed",
+                    message = AI_TIMEOUT_MESSAGE,
+                    retry = {
+                        runAiTask(
+                            task = task,
+                            text = text,
+                            book = book,
+                            chapterTitle = chapterTitle,
+                            selection = selection,
+                            processingPageIndex = processingPageIndex,
+                        )
+                    },
+                )
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
@@ -1472,6 +1602,16 @@ class ReaderViewModel(
                     message = error.toAiUiMessage(
                         "AI ${task.title.lowercase()} failed. Please try again.",
                     ),
+                    retry = {
+                        runAiTask(
+                            task = task,
+                            text = text,
+                            book = book,
+                            chapterTitle = chapterTitle,
+                            selection = selection,
+                            processingPageIndex = processingPageIndex,
+                        )
+                    },
                 )
             } finally {
                 setWorking(false)
@@ -1625,11 +1765,12 @@ class ReaderViewModel(
         return response
     }
 
-    private fun String.usableAiTextOrNull(): String? = trim().takeIf {
-        it.isNotEmpty() &&
-            !it.equals("null", ignoreCase = true) &&
-            !it.equals("undefined", ignoreCase = true)
-    }
+    private fun String.usableAiTextOrNull(): String? =
+        AiResponseSanitizer.sanitize(this).trim().takeIf {
+            it.isNotEmpty() &&
+                !it.equals("null", ignoreCase = true) &&
+                !it.equals("undefined", ignoreCase = true)
+        }
 
     private fun AiTask.toReaderTask(): AskAiEngine.Task = when (this) {
         AiTask.SUMMARIZE -> AskAiEngine.Task.SUMMARIZE
@@ -1637,34 +1778,98 @@ class ReaderViewModel(
         AiTask.EXTRACT_QUOTE -> AskAiEngine.Task.EXTRACT_QUOTE
     }
 
+    /**
+     * Parses the strict JSON quote response without being defeated by a fence,
+     * a short preamble, a trailing comma, or lowercase header text. When the
+     * model emits malformed JSON, field-level recovery still extracts the two
+     * values instead of showing "invalid quote format".
+     */
     private fun parseQuote(response: String): Pair<String, String> {
-        val json = response
-            .removePrefix("```json")
-            .removePrefix("```")
-            .removeSuffix("```")
-            .trim()
-        val result = try {
-            JSONObject(json)
-        } catch (error: org.json.JSONException) {
-            throw IOException("AI returned an invalid quote format.", error)
+        val cleaned = AiResponseSanitizer.sanitize(
+            response,
+            extractFencedPayload = true,
+            stripChatter = false,
+        )
+        val jsonText = extractJsonObject(cleaned) ?: cleaned
+        val result = runCatching { JSONObject(jsonText) }.getOrNull()
+
+        val headerRaw = result?.optString("header").orEmpty().ifBlank {
+            HEADER_FIELD_REGEX.find(cleaned)?.groupValues?.getOrNull(1).orEmpty()
         }
-        val header = result.optString("header").trim()
-        val quote = result.optString("quote").trim()
-        if (!header.matches(Regex("[A-Z][A-Z -]{0,23}")) || quote.isBlank()) {
-            throw IOException("AI returned an invalid quote format.")
+        val quoteRaw = result?.optString("quote").orEmpty().ifBlank {
+            QUOTE_FIELD_REGEX.find(cleaned)?.groupValues?.getOrNull(1).orEmpty()
+        }
+
+        val header = headerRaw
+            .uppercase(Locale.US)
+            .replace(NON_HEADER_CHARS, " ")
+            .replace(WHITESPACE, " ")
+            .trim()
+            .take(MAX_QUOTE_HEADER_CHARS)
+            .ifBlank { "QUOTE" }
+        val quote = AiResponseSanitizer
+            .sanitize(quoteRaw, stripChatter = false)
+            .replace(WHITESPACE, " ")
+            .trim()
+            .trim('"', '\'', '“', '”', '‘', '’', ',', ';')
+
+        if (
+            quote.isBlank() ||
+            quote.length > MAX_READER_QUOTE_CHARS ||
+            AiResponseSanitizer.isArtifact(quote) ||
+            !QuoteQualityValidator.isValidQuote(quote)
+        ) {
+            throw IOException("AI returned an invalid quote format. Please try again.")
         }
         return header to quote
     }
 
-    private fun closePdfRenderer() {
-        synchronized(stateLock) {
-            renderingPages.clear()
-            renderedPdfPages.clear()
-            pdfRenderer?.close()
-            pdfRenderer = null
-            pdfRendererBookId = null
-            pdfDescriptor?.close()
-            pdfDescriptor = null
+    /**
+     * Extracts the first balanced JSON object. Braces inside quoted strings are
+     * ignored, so a quote containing `{` or `}` cannot truncate the payload.
+     */
+    private fun extractJsonObject(text: String): String? {
+        val start = text.indexOf('{')
+        if (start < 0) return null
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for (index in start until text.length) {
+            val char = text[index]
+            if (inString) {
+                when {
+                    escaped -> escaped = false
+                    char == '\\' -> escaped = true
+                    char == '"' -> inString = false
+                }
+                continue
+            }
+            when (char) {
+                '"' -> inString = true
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) {
+                        return text.substring(start, index + 1)
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    private suspend fun closePdfRenderer() {
+        // Wait for any in-flight native render to release the renderer before
+        // closing it; otherwise the native call can race with teardown.
+        pdfRenderMutex.withLock {
+            synchronized(stateLock) {
+                renderingPages.clear()
+                pdfRenderer?.close()
+                pdfRenderer = null
+                pdfRendererBookId = null
+                pdfDescriptor?.close()
+                pdfDescriptor = null
+            }
         }
     }
 
@@ -1706,10 +1911,15 @@ class ReaderViewModel(
     private companion object {
         const val TAG = "ReaderViewModel"
         const val AI_ERROR_TAG = "VibeReader_AI"
-        const val MAX_AI_CHUNK_CHARS = 12_000
+        const val MAX_AI_CHUNK_CHARS = 16_000
         const val MAX_ASK_CONTEXT_CHARS = 12_000
-        /** Hard ceiling for a whole AI action, including chunked summaries. */
-        const val MAX_AI_OPERATION_MS = 180_000L
+
+        /**
+         * Hard ceiling for a whole AI action, including chunked summaries.
+         * Each chunk gets its own 90-second failover budget; the outer ceiling
+         * must leave room for several chunks instead of cancelling halfway.
+         */
+        const val MAX_AI_OPERATION_MS = 300_000L
         const val AI_TIMEOUT_MESSAGE =
             "The AI request timed out. Check your internet connection and try again."
         const val MAX_STORED_TEXT_CHARS = 100_000
@@ -1719,11 +1929,24 @@ class ReaderViewModel(
         const val MAX_PDF_BITMAP_PIXELS = 12_000_000L
         const val MAX_PDF_BITMAP_DIMENSION = 8192
         const val MAX_CACHED_PDF_PAGES = 3
+        const val PDF_CACHE_WIDTH_BUCKET_PX = 256
         const val MAX_PDF_PAGE_TEXT_CHARS = 1_000_000
         const val PDF_LAYOUT_WAIT_TIMEOUT_MS = 250L
         const val PROGRESS_SAVE_DELAY_MS = 500L
         const val OPEN_DEFERRAL_MS = 180L
+        const val READER_PREFERENCES_NAME = "reader_settings"
+        const val KEY_CROP_PDF_WHITESPACE = "crop_pdf_whitespace"
         val EPUB_LOCATION_REGEX = Regex("""epub:(\d+):(\d+)""")
+        const val MAX_QUOTE_HEADER_CHARS = 24
+        const val MAX_READER_QUOTE_CHARS = 1_200
+        val WHITESPACE = Regex("""\s+""")
+        val NON_HEADER_CHARS = Regex("[^A-Za-z0-9 -]")
+        val HEADER_FIELD_REGEX = Regex(
+            "(?i)\"header\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"",
+        )
+        val QUOTE_FIELD_REGEX = Regex(
+            "(?i)\"quote\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"",
+        )
     }
 
     private fun maxPdfBitmapPixels(): Long =

@@ -115,6 +115,73 @@ internal fun renderPageCrisp(
 }
 
 /**
+ * Crops the uniform white margins around a rendered PDF page.
+ *
+ * Sampling is intentionally sparse (every 4th row and every 4th column) so a
+ * large page costs only a fraction of a full scan. The crop is rejected when
+ * the detected ink rectangle is too small to be real content, which protects
+ * against isolated speckles in an otherwise blank page. A 4% safe margin is
+ * added around the detected bounds before the bitmap is trimmed.
+ *
+ * Must run on a background dispatcher. [PdfRenderer] access is unaffected: the
+ * bitmap is already fully rendered when this is called.
+ */
+internal fun cropPdfWhitespaceMargins(bitmap: Bitmap): Bitmap {
+    if (bitmap.isRecycled || bitmap.width < 8 || bitmap.height < 8) return bitmap
+    return try {
+        val width = bitmap.width
+        val height = bitmap.height
+        val row = IntArray(width)
+        var minX = width
+        var minY = height
+        var maxX = -1
+        var maxY = -1
+        var y = 0
+        while (y < height) {
+            bitmap.getPixels(row, 0, width, 0, y, width, 1)
+            var x = 0
+            while (x < width) {
+                val pixel = row[x]
+                val isInk =
+                    Color.red(pixel) < 245 ||
+                        Color.green(pixel) < 245 ||
+                        Color.blue(pixel) < 245
+                if (isInk) {
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+                x += 4
+            }
+            y += 4
+        }
+        if (maxX < 0 || maxY < 0) return bitmap
+
+        val inkWidth = maxX - minX + 1
+        val inkHeight = maxY - minY + 1
+        if (inkWidth <= width * 0.20f || inkHeight <= height * 0.15f) return bitmap
+
+        val padX = (width * 0.04f).roundToInt().coerceAtLeast(1)
+        val padY = (height * 0.04f).roundToInt().coerceAtLeast(1)
+        val left = (minX - padX).coerceAtLeast(0)
+        val top = (minY - padY).coerceAtLeast(0)
+        val right = (maxX + padX + 1).coerceAtMost(width)
+        val bottom = (maxY + padY + 1).coerceAtMost(height)
+        if (left <= 0 && top <= 0 && right >= width && bottom >= height) return bitmap
+
+        val cropped = Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
+        if (cropped !== bitmap && !bitmap.isRecycled) {
+            bitmap.recycle()
+        }
+        cropped
+    } catch (error: Throwable) {
+        Log.w(TAG, "Could not crop PDF whitespace margins; keeping full page.", error)
+        bitmap
+    }
+}
+
+/**
  * Best-effort low-resolution fallback after OOM. Returns `null` if even a small
  * allocation cannot be satisfied.
  */

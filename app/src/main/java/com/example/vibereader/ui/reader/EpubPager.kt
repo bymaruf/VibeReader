@@ -1,5 +1,6 @@
 package com.example.vibereader.ui.reader
 
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
@@ -9,6 +10,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.flow.distinctUntilChanged
 
@@ -24,6 +26,7 @@ fun EpubPager(
     currentPageIndex: Int,
     onPageChanged: (Int) -> Unit,
     modifier: Modifier = Modifier,
+    onCanvasTap: () -> Unit = {},
     content: @Composable (pageIndex: Int) -> Unit,
 ) {
     if (pageCount <= 0) return
@@ -53,7 +56,13 @@ fun EpubPager(
         userScrollEnabled = true,
         contentPadding = PaddingValues(0.dp),
     ) { page ->
-        Box(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(page) {
+                    detectTapGestures(onTap = { onCanvasTap() })
+                },
+        ) {
             content(page)
         }
     }

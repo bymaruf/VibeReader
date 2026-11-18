@@ -13,12 +13,11 @@ import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
 import android.text.TextUtils
-import android.util.DisplayMetrics
-import android.view.WindowManager
 import com.example.vibereader.domain.QuoteQualityValidator
 import com.example.vibereader.domain.model.WallpaperLayoutVariant
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -51,6 +50,12 @@ object TypographyWallpaperGenerator {
         bookAuthor: String? = null,
         layoutVariant: WallpaperLayoutVariant = WallpaperLayoutVariant.CLASSIC,
         isDarkMode: Boolean = true,
+        /**
+         * Resolution multiplier for carousel previews. Applying a wallpaper
+         * always uses 1f (the device's full 1080x2400-class resolution), while
+         * the pager can hold many more cards by rendering lightweight previews.
+         */
+        outputScale: Float = 1f,
     ): Bitmap = withContext(Dispatchers.IO) {
         if (!QuoteQualityValidator.isValidQuote(quote)) {
             throw IOException("The selected quote is incomplete or too short for a wallpaper.")
@@ -64,19 +69,19 @@ object TypographyWallpaperGenerator {
             ?.let(FilenameSanitizer::cleanBookTitle)
             ?.takeIf(String::isNotBlank)
 
-        val metrics = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
-            ?: throw IOException("Could not access the device display.")
-        @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getRealMetrics(metrics)
-        val widthF = metrics.widthPixels.toFloat()
-        val heightF = metrics.heightPixels.toFloat()
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        if (width <= 0 || height <= 0) {
-            throw IOException("Could not determine the device wallpaper dimensions.")
-        }
+        // Always render the canonical 1080x2400 lock-screen canvas. Deriving
+        // the size from display metrics made output device-dependent and could
+        // produce different crops/hashes for the same quote. Previews simply
+        // scale this same canvas down, so a rendered card always matches the
+        // wallpaper that Apply writes.
+        val scale = outputScale
+            .takeIf { it.isFinite() }
+            ?.coerceIn(PREVIEW_MIN_SCALE, 1f)
+            ?: 1f
+        val width = (WALLPAPER_WIDTH_PX * scale).roundToInt().coerceAtLeast(1)
+        val height = (WALLPAPER_HEIGHT_PX * scale).roundToInt().coerceAtLeast(1)
+        val widthF = width.toFloat()
+        val heightF = height.toFloat()
         val bitmapBytes = width.toLong() * height * BYTES_PER_PIXEL
         if (bitmapBytes > Runtime.getRuntime().maxMemory() / MAX_HEAP_FRACTION) {
             throw IOException("The device display is too large to render safely.")
@@ -415,6 +420,9 @@ object TypographyWallpaperGenerator {
     private const val JPEG_QUALITY = 92
     private const val BYTES_PER_PIXEL = 4L
     private const val MAX_HEAP_FRACTION = 4L
+    private const val WALLPAPER_WIDTH_PX = 1080
+    private const val WALLPAPER_HEIGHT_PX = 2400
+    private const val PREVIEW_MIN_SCALE = 0.25f
 
     // Dark canvas theme: dark background (#0F172A / #121212), white quote text.
     private const val DARK_QUOTE_COLOR = 0xFFFFFFFF.toInt()
@@ -464,7 +472,12 @@ object TypographyWallpaperGenerator {
     private const val QUOTE_LINE_SPACING_MULTIPLIER = 1.18f
     private const val QUOTE_SHRINK_FACTOR = 0.92f
     private const val MIN_QUOTE_TEXT_SCALE = 0.62f
-    private const val MAX_QUOTE_LINES = 12
+    /**
+     * Generous relative to the 260-character quote cap (roughly 6–9 wrapped
+     * lines at the minimum readable text size), so a valid quote is never
+     * silently ellipsized. The shrink loop still guarantees it fits the band.
+     */
+    private const val MAX_QUOTE_LINES = 16
 
     /**
      * Hardcoded fallback quote used when the AI path cannot produce anything

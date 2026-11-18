@@ -22,6 +22,14 @@ class EpubViewModel {
     var currentPageIndex: Int by mutableIntStateOf(0)
         private set
 
+    /**
+     * Character anchor of the last visible slice. Retained when a viewport
+     * change temporarily empties [allPages], so repagination can restore the
+     * same chapter/character position instead of the old numeric page index.
+     */
+    var lastAnchor: EpubPageSlice? by mutableStateOf(null)
+        private set
+
     /** Progress bound to (currentPageIndex + 1) / totalCalculatedPages. */
     val progress: Float
         get() = if (totalCalculatedPages > 0) {
@@ -40,6 +48,9 @@ class EpubViewModel {
         get() = if (allPages.isEmpty()) 0 else currentPageIndex.coerceIn(0, allPages.lastIndex)
 
     fun setCalculatedPages(pages: List<EpubPageSlice>, restoreIndex: Int = currentPageIndex) {
+        if (pages.isNotEmpty()) {
+            lastAnchor = pages.getOrNull(restoreIndex.coerceIn(0, pages.lastIndex))
+        }
         allPages = pages
         currentPageIndex = if (pages.isEmpty()) 0 else restoreIndex.coerceIn(0, pages.lastIndex)
     }
@@ -50,6 +61,7 @@ class EpubViewModel {
             return
         }
         currentPageIndex = pageIndex.coerceIn(0, allPages.lastIndex)
+        lastAnchor = allPages.getOrNull(currentPageIndex)
     }
 
     fun restoreFromProgress(savedProgress: Float, savedPageIndexHint: Int = -1) {
@@ -60,6 +72,7 @@ class EpubViewModel {
             else -> 0
         }.coerceIn(0, allPages.lastIndex)
         currentPageIndex = target
+        lastAnchor = allPages.getOrNull(target)
     }
 
     fun jumpToChapter(chapterIndex: Int) {
